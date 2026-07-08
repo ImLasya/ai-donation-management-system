@@ -49,3 +49,17 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+
+class DonorProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+
+class NGOProfileUpdate(BaseModel):
+    contactPerson: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    mission: Optional[str] = None

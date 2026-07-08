@@ -241,6 +241,7 @@ function Review() {
                       condition: it.condition,
                       confidence_score: it.confidence ?? null,
                       source: it.confidence ? "AI" : "MANUAL",
+                      is_confirmed: true,
                     })),
                   };
 

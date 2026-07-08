@@ -53,12 +53,15 @@ function DonatePage() {
 
       setStage(3); // Catalog generation
       // Map bounding boxes from pixels to percentages for drawing overlay
-      const detections = res.detections.map((d) => ({
+      const detections = res.raw_detections.map((d) => ({
         id: d.id,
-        label: d.item_name,
-        category: d.category as Category,
+        label: d.label,
+        category: d.donation_category as Category,
         quantity: 1,
         confidence: d.confidence,
+        eligibilityStatus: d.eligibility_status,
+        rejectionReason: d.rejection_reason,
+        confirmedByUser: d.eligibility_status === "DONATABLE",
         bbox: {
           x: (d.bbox.x1 / res.image_width) * 100,
           y: (d.bbox.y1 / res.image_height) * 100,
@@ -127,18 +130,27 @@ function DonatePage() {
           <div className="lg:col-span-2">
             <CameraCapture onCapture={handleCapture} />
           </div>
-          <Card className="p-5">
-            <h3 className="font-semibold text-foreground">Tips for a good scan</h3>
-            <ul className="mt-3 space-y-2 text-sm text-muted-foreground">
-              <li>• Lay items out with good lighting</li>
-              <li>• Keep the camera steady and level</li>
-              <li>• Group similar items together</li>
-              <li>• Avoid clutter and busy backgrounds</li>
+          <Card className="p-5 space-y-4">
+            <div className="flex items-center gap-2">
+              <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636-.707.707M21 12h-1M4 12H3m1.636-6.364-.707-.707M6.343 17.657l-.707.707M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z"/></svg>
+              </div>
+              <h3 className="font-semibold text-foreground">Tips for a good scan</h3>
+            </div>
+            <ul className="space-y-3">
+              {[
+                { icon: "☀️", tip: "Lay items out with good lighting" },
+                { icon: "📷", tip: "Keep the camera steady and level" },
+                { icon: "📦", tip: "Group similar items together" },
+                { icon: "🧹", tip: "Avoid clutter and busy backgrounds" },
+                { icon: "📐", tip: "Fill the frame — get close to items" },
+              ].map(({ icon, tip }) => (
+                <li key={tip} className="flex items-start gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2.5 text-sm text-foreground">
+                  <span className="text-base leading-none mt-0.5">{icon}</span>
+                  <span>{tip}</span>
+                </li>
+              ))}
             </ul>
-            <p className="mt-4 rounded-lg bg-muted p-3 text-xs text-muted-foreground">
-              Detection runs on a mock AI model in demo mode. The flow is ready to connect to a
-              YOLOv8 FastAPI endpoint via <code>POST /api/detection/analyze</code>.
-            </p>
           </Card>
         </div>
       )}

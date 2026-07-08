@@ -168,6 +168,7 @@ class Notification(Base):
     type = Column(String(50), nullable=False) # "REQUEST", "ACCEPT", "REJECT", "PICKUP"
     related_request_id = Column(BigInteger, nullable=True)
     is_read = Column(Boolean, default=False, nullable=False)
+    deduplication_key = Column(String(255), unique=True, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="notifications")

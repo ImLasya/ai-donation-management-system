@@ -44,6 +44,7 @@ interface AppState {
     mission?: string;
   }) => Promise<{ success: boolean; error?: string; user?: User }>;
   logout: () => void;
+  updateUser: (patch: Partial<User>) => void;
   draft: DonationDraft;
   setDraft: (d: Partial<DonationDraft>) => void;
   resetDraft: () => void;
@@ -315,6 +316,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setUser(null);
       localStorage.removeItem("da_token");
       localStorage.removeItem("da_user");
+    },
+    updateUser: (patch) => {
+      setUser((prev) => prev ? { ...prev, ...patch } : prev);
     },
     draft,
     setDraft: (d) => setDraftState((p) => ({ ...p, ...d })),

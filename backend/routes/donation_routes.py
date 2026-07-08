@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
 from database import get_db
 from routes.auth_routes import get_current_user
 import models
@@ -26,6 +27,8 @@ class DonationItemCreate(BaseModel):
     confidence_score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence must be between 0 and 1")
     source: str  # "AI" or "MANUAL"
     notes: Optional[str] = None
+    is_confirmed: Optional[bool] = Field(False, description="Manual confirmation for items that need review")
+
 
 class DonationCreate(BaseModel):
     items: List[DonationItemCreate]
@@ -83,6 +86,24 @@ async def create_donation(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot submit an empty list of items."
         )
+
+    # Validate items through DonationEligibilityService before persisting
+    from services.donation_eligibility_service import DonationEligibilityService
+
+    for item in payload.items:
+        eligibility = DonationEligibilityService.classify_detection(item.item_name)
+        if eligibility == "NON_DONATABLE":
+            reason = DonationEligibilityService.get_rejection_reason(item.item_name) or "Item is not eligible for donation."
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Rejection: '{item.item_name}' was rejected: {reason}"
+            )
+        if eligibility == "REVIEW_REQUIRED":
+            if not item.is_confirmed:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Confirmation required: '{item.item_name}' requires manual review and confirmation before it can be submitted."
+                )
 
     try:
         # Create donation in ITEMS_SUBMITTED status
@@ -1201,3 +1222,278 @@ async def complete_donation(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+# ----------------- DONOR IMPACT ANALYTICS -----------------
+
+class ImpactSummaryResponse(BaseModel):
+    total_donations: int
+    total_items_donated: int
+    ngos_helped: int
+    beneficiaries_reached: Optional[int]
+    beneficiaries_is_estimated: bool
+    beneficiaries_estimation_method: Optional[str]
+
+class MonthlyDonationPoint(BaseModel):
+    month: str
+    year: int
+    count: int
+
+class CategoryDistributionItem(BaseModel):
+    category: str
+    quantity: int
+
+class AchievementResponse(BaseModel):
+    key: str
+    title: str
+    description: str
+    unlocked: bool
+    progress: int
+    target: int
+    unlocked_at: Optional[str] = None
+
+class DonorImpactResponse(BaseModel):
+    summary: ImpactSummaryResponse
+    monthly_donations: List[MonthlyDonationPoint]
+    category_distribution: List[CategoryDistributionItem]
+    achievements: List[AchievementResponse]
+
+QUALIFYING_IMPACT_STATUSES = {
+    "NGO_ACCEPTED",
+    "PACKAGING_IN_PROGRESS",
+    "READY_FOR_PICKUP",
+    "PICKUP_SCHEDULED",
+    "PICKUP_IN_PROGRESS",
+    "COMPLETED"
+}
+
+@router.get("/impact", response_model=DonorImpactResponse)
+async def get_donor_impact(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != models.UserRole.DONOR:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only donors can access impact analytics."
+        )
+
+    # 1. Total Qualifying Donations (Count)
+    total_donations = db.query(func.count(models.Donation.id)).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(QUALIFYING_IMPACT_STATUSES)
+    ).scalar() or 0
+
+    # 2. Total Items Donated (Sum)
+    total_items_donated = db.query(func.coalesce(func.sum(models.DonationItem.quantity), 0)).join(
+        models.Donation, models.Donation.id == models.DonationItem.donation_id
+    ).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(QUALIFYING_IMPACT_STATUSES)
+    ).scalar() or 0
+
+    # 3. NGOs Helped (Distinct Count)
+    ngos_helped = db.query(func.count(func.distinct(models.Donation.ngo_id))).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(QUALIFYING_IMPACT_STATUSES),
+        models.Donation.ngo_id.isnot(None)
+    ).scalar() or 0
+
+    # 4. Beneficiaries Reached (Estimation Formula: total_items_donated * 3)
+    beneficiaries_reached = total_items_donated * 3
+    beneficiaries_is_estimated = True
+    beneficiaries_estimation_method = "total_items_donated * 3"
+
+    # 5. Monthly Donations Chart Data
+    # Get completion subquery to find canonical first completion transition timestamp per donation
+    completion_subquery = db.query(
+        models.DonationStatusHistory.donation_id,
+        func.min(models.DonationStatusHistory.created_at).label('completed_at')
+    ).filter(
+        models.DonationStatusHistory.new_status == "COMPLETED"
+    ).group_by(
+        models.DonationStatusHistory.donation_id
+    ).subquery()
+
+    donations_data = db.query(
+        models.Donation.id,
+        models.Donation.created_at,
+        models.Donation.status,
+        completion_subquery.c.completed_at
+    ).outerjoin(
+        completion_subquery,
+        models.Donation.id == completion_subquery.c.donation_id
+    ).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(QUALIFYING_IMPACT_STATUSES)
+    ).all()
+
+    # Generate last 12 months array
+    import datetime
+    today = datetime.date.today()
+    months_list = []
+    for i in range(11, -1, -1):
+        year = today.year
+        month = today.month - i
+        while month <= 0:
+            month += 12
+            year -= 1
+        
+        month_name = datetime.date(year, month, 1).strftime("%b")
+        months_list.append({
+            "month": month_name,
+            "year": year,
+            "count": 0,
+            "month_num": month
+        })
+
+    # Group donations by "impact activity month"
+    for d in donations_data:
+        # completed donations -> first completion transition timestamp
+        # other qualifying progressed donations -> donation.created_at
+        if d.status == "COMPLETED" and d.completed_at:
+            dt = d.completed_at
+        else:
+            dt = d.created_at
+        
+        if dt:
+            d_year = dt.year
+            d_month = dt.month
+            for m in months_list:
+                if m["year"] == d_year and m["month_num"] == d_month:
+                    m["count"] += 1
+                    break
+
+    # Map to schema-compliant response points
+    monthly_points = [
+        MonthlyDonationPoint(month=m["month"], year=m["year"], count=m["count"])
+        for m in months_list
+    ]
+
+    # 6. Category Distribution
+    category_counts = db.query(
+        models.DonationItem.category,
+        func.sum(models.DonationItem.quantity).label('quantity')
+    ).join(
+        models.Donation, models.Donation.id == models.DonationItem.donation_id
+    ).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(QUALIFYING_IMPACT_STATUSES)
+    ).group_by(
+        models.DonationItem.category
+    ).all()
+
+    category_map = {}
+    for row in category_counts:
+        cat = row.category.strip() if row.category else ""
+        if not cat:
+            cat_key = "Other"
+        else:
+            cat_key = cat.title()
+        
+        category_map[cat_key] = category_map.get(cat_key, 0) + row.quantity
+
+    category_distribution = sorted(
+        [CategoryDistributionItem(category=k, quantity=v) for k, v in category_map.items()],
+        key=lambda x: x.quantity,
+        reverse=True
+    )
+
+    # 7. Achievements Calculation
+    first_donation_date = None
+    if total_donations >= 1:
+        min_dt = None
+        for d in donations_data:
+            dt = d.completed_at if (d.status == "COMPLETED" and d.completed_at) else d.created_at
+            if dt:
+                if min_dt is None or dt < min_dt:
+                    min_dt = dt
+        if min_dt:
+            first_donation_date = min_dt.isoformat()
+
+    def get_start_of_week(dt):
+        d = dt.date() if isinstance(dt, datetime.datetime) else dt
+        return d - datetime.timedelta(days=d.weekday())
+
+    donation_weeks = set()
+    for d in donations_data:
+        dt = d.completed_at if (d.status == "COMPLETED" and d.completed_at) else d.created_at
+        if dt:
+            donation_weeks.add(get_start_of_week(dt))
+    
+    unique_weeks = sorted(list(donation_weeks))
+    max_streak = 0
+    current_streak = 0
+    prev_week = None
+    for w in unique_weeks:
+        if prev_week is None:
+            current_streak = 1
+        elif (w - prev_week).days == 7:
+            current_streak += 1
+        elif (w - prev_week).days > 7:
+            max_streak = max(max_streak, current_streak)
+            current_streak = 1
+        prev_week = w
+    max_streak = max(max_streak, current_streak)
+
+    achievements = [
+        AchievementResponse(
+            key="FIRST_DONATION",
+            title="First Donation",
+            description="Complete your first donation",
+            unlocked=total_donations >= 1,
+            progress=min(total_donations, 1),
+            target=1,
+            unlocked_at=first_donation_date
+        ),
+        AchievementResponse(
+            key="STREAK_5_WEEK",
+            title="5-Week Streak",
+            description="Donate in 5 consecutive calendar weeks",
+            unlocked=max_streak >= 5,
+            progress=min(max_streak, 5),
+            target=5,
+            unlocked_at=None
+        ),
+        AchievementResponse(
+            key="HELPED_5_NGOS",
+            title="5 NGOs Helped",
+            description="Support 5 or more unique NGOs",
+            unlocked=ngos_helped >= 5,
+            progress=min(ngos_helped, 5),
+            target=5,
+            unlocked_at=None
+        ),
+        AchievementResponse(
+            key="ITEMS_100_MILESTONE",
+            title="100 Items Milestone",
+            description="Donate 100 or more items",
+            unlocked=total_items_donated >= 100,
+            progress=min(total_items_donated, 100),
+            target=100,
+            unlocked_at=None
+        ),
+        AchievementResponse(
+            key="BENEFICIARIES_1000",
+            title="1,000 Beneficiaries",
+            description="Reach 1,000 or more beneficiaries",
+            unlocked=beneficiaries_reached >= 1000,
+            progress=min(beneficiaries_reached, 1000),
+            target=1000,
+            unlocked_at=None
+        )
+    ]
+
+    return DonorImpactResponse(
+        summary=ImpactSummaryResponse(
+            total_donations=total_donations,
+            total_items_donated=total_items_donated,
+            ngos_helped=ngos_helped,
+            beneficiaries_reached=beneficiaries_reached,
+            beneficiaries_is_estimated=beneficiaries_is_estimated,
+            beneficiaries_estimation_method=beneficiaries_estimation_method
+        ),
+        monthly_donations=monthly_points,
+        category_distribution=category_distribution,
+        achievements=achievements
+    )
+

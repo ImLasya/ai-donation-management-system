@@ -1,27 +1,33 @@
-import type { DetectionResult } from "@/types";
+export interface DetectionItem {
+  id: string;
+  class_id: number;
+  label: string;
+  normalized_label: string;
+  confidence: number;
+  bbox: {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  };
+  eligibility_status: "DONATABLE" | "NON_DONATABLE" | "REVIEW_REQUIRED";
+  donation_category: string;
+  rejection_reason: string | null;
+}
 
 export interface DetectionResponse {
   image_width: number;
   image_height: number;
-  detections: Array<{
-    id: string;
-    class_id: number;
-    item_name: string;
-    category: string;
-    confidence: number;
-    bbox: {
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-    };
-  }>;
+  raw_detections: DetectionItem[];
+  donatable_detections: DetectionItem[];
+  rejected_detections: DetectionItem[];
   grouped_items: Array<{
     item_name: string;
     category: string;
     quantity: number;
     confidence: number;
   }>;
+  detections?: DetectionItem[];
 }
 
 export async function analyzeDonationImage(file: File | Blob): Promise<DetectionResponse> {

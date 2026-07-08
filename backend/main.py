@@ -180,20 +180,32 @@ app.include_router(donation_routes.router)
 
 def load_yolo_model():
     from config import settings
+    import os
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+
+    model_to_load = None
+    if settings.YOLO_MODEL_PATH:
+        if not os.path.exists(settings.YOLO_MODEL_PATH):
+            err_msg = f"Configured YOLO_MODEL_PATH '{settings.YOLO_MODEL_PATH}' does not exist!"
+            logger.error(err_msg)
+            yolo_model.yolo_error = err_msg
+            yolo_model.yolo_instance = None
+            return
+        logger.info(f"Loading custom YOLO model from path: {settings.YOLO_MODEL_PATH}")
+        model_to_load = settings.YOLO_MODEL_PATH
+    else:
+        logger.info(f"Loading YOLO model by name: {settings.YOLO_MODEL_NAME}")
+        model_to_load = settings.YOLO_MODEL_NAME
+
     try:
         from ultralytics import YOLO
-        logger_name = "uvicorn.error"
-        import logging
-        logger = logging.getLogger(logger_name)
-        logger.info(f"Loading YOLOv8 model from {settings.YOLO_MODEL_PATH}...")
-        yolo_model.yolo_instance = YOLO(settings.YOLO_MODEL_PATH)
-        logger.info(f"YOLOv8 model loaded successfully: {settings.YOLO_MODEL_PATH}")
+        yolo_model.yolo_instance = YOLO(model_to_load)
+        logger.info(f"YOLO26s model loaded successfully: {model_to_load}")
     except Exception as e:
         yolo_model.yolo_error = str(e)
         yolo_model.yolo_instance = None
-        import logging
-        logger = logging.getLogger("uvicorn.error")
-        logger.error(f"Failed to load YOLO model: {e}")
+        logger.error(f"Failed to load YOLO model ({model_to_load}): {e}")
 
 @app.on_event("startup")
 def startup_event():

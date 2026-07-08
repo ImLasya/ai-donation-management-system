@@ -198,3 +198,56 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
 @router.get("/me", response_model=schemas.UserResponse)
 def get_me(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     return format_user_response(user, db)
+
+@router.put("/profile", response_model=schemas.UserResponse)
+def update_profile(
+    payload: dict,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the current user's profile fields.
+    Accepts any subset of: name/full_name, phone, city, state, address (NGO only), contactPerson (NGO only), mission (NGO only).
+    """
+    try:
+        if user.role == models.UserRole.DONOR:
+            profile = user.donor_profile
+            if not profile:
+                raise HTTPException(status_code=404, detail="Donor profile not found.")
+            if "name" in payload and payload["name"]:
+                profile.full_name = payload["name"].strip()
+            if "phone" in payload and payload["phone"]:
+                profile.phone = payload["phone"].strip()
+            if "city" in payload and payload["city"]:
+                profile.city = payload["city"].strip()
+            if "state" in payload and payload["state"]:
+                profile.state = payload["state"].strip()
+
+        elif user.role == models.UserRole.NGO:
+            profile = user.ngo_profile
+            if not profile:
+                raise HTTPException(status_code=404, detail="NGO profile not found.")
+            if "contactPerson" in payload and payload["contactPerson"]:
+                profile.contact_person = payload["contactPerson"].strip()
+            if "phone" in payload and payload["phone"]:
+                profile.phone = payload["phone"].strip()
+            if "city" in payload and payload["city"]:
+                profile.city = payload["city"].strip()
+            if "state" in payload and payload["state"]:
+                profile.state = payload["state"].strip()
+            if "address" in payload and payload["address"]:
+                profile.address = payload["address"].strip()
+            if "mission" in payload and payload["mission"]:
+                profile.mission = payload["mission"].strip()
+        else:
+            raise HTTPException(status_code=403, detail="Profile updates are not supported for this role.")
+
+        db.commit()
+        db.refresh(user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")
+
+    return format_user_response(user, db)

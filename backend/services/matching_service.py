@@ -117,7 +117,10 @@ class MatchingService:
                 return False
 
             # 1. Ensure all donation items have embeddings
+            from services.donation_eligibility_service import DonationEligibilityService
             for item in donation.items:
+                if DonationEligibilityService.classify_detection(item.item_name) == "NON_DONATABLE":
+                    continue
                 normalized_text = cls.normalize_text(item.item_name, item.category)
                 # Check if changed or missing
                 if not item.embedding:
@@ -182,6 +185,8 @@ class MatchingService:
                 reasons = []
 
                 for d_item in donation.items:
+                    if DonationEligibilityService.classify_detection(d_item.item_name) == "NON_DONATABLE":
+                        continue
                     best_sim = 0.0
                     best_match_item = None
                     best_match_rem = 0

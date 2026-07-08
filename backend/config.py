@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -12,7 +13,8 @@ class Settings(BaseSettings):
     )
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
-    YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "yolov8s.pt")
+    YOLO_MODEL_NAME: str = os.getenv("YOLO_MODEL_NAME", "yolo26s.pt")
+    YOLO_MODEL_PATH: Optional[str] = os.getenv("YOLO_MODEL_PATH", None)
     YOLO_CONFIDENCE_THRESHOLD: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.25"))
 
     # NGO matching configurations
@@ -20,6 +22,7 @@ class Settings(BaseSettings):
     MATCH_MIN_SCORE: float = float(os.getenv("MATCH_MIN_SCORE", "40.0"))
     SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.65"))
     MATCH_NOTIFICATION_THRESHOLD: float = float(os.getenv("MATCH_NOTIFICATION_THRESHOLD", "75.0"))
+    DONATION_MATCH_WAIT_DAYS: int = int(os.getenv("DONATION_MATCH_WAIT_DAYS", "30"))
     
     WEIGHT_ITEM_MATCH: float = 0.45
     WEIGHT_QUANTITY_FIT: float = 0.20

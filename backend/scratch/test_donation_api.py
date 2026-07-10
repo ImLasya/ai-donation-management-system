@@ -181,6 +181,7 @@ def test_workflow():
     # 6. NGO Requests Matching & Request dispatch
     print("\n[Test 6] Donor A sends request to NGO A...")
     res = requests.post(f"{BASE_URL}/api/donations/{donation_id}/requests", json={"ngo_id": sess_ngo_a["user_id"]}, headers=sess_donor_a["headers"])
+    print(f"DEBUG SEND REQUEST: Status: {res.status_code}, Body: {res.text}")
     assert res.status_code == 200
     request_id = res.json()["request_id"]
 

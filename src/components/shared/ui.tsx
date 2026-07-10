@@ -75,6 +75,18 @@ const statusTones: Record<string, string> = {
   Operational: "bg-success/10 text-success",
   Degraded: "bg-accent/20 text-accent-foreground",
   Down: "bg-destructive/10 text-destructive",
+  "Waiting for NGO Match": "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400",
+  "New Match Available": "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400",
+  "Items Submitted": "bg-muted text-muted-foreground",
+  "Awaiting NGO": "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400",
+  "Accepted": "bg-primary/10 text-primary",
+  "Packaging": "bg-secondary/10 text-secondary",
+  "Ready for Pickup": "bg-success/10 text-success",
+  "Pickup Scheduled": "bg-secondary/10 text-secondary",
+  "Pickup In Progress": "bg-accent/20 text-accent-foreground",
+  "Completed": "bg-success/10 text-success",
+  "Declined": "bg-destructive/10 text-destructive",
+  "Draft": "bg-muted text-muted-foreground",
 };
 
 export function StatusBadge({ status }: { status: string }) {

@@ -4,18 +4,32 @@ import json
 from typing import List, Optional
 from datetime import date
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from database import get_db
+from database import get_db, SessionLocal
 from routes.auth_routes import get_current_user
 import models
+from config import settings
+from services.matching_service import MatchingService
 
 # Configure logger
 logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/api/donations", tags=["Donations Workflow"])
+
+def rematch_demand_background(demand_id: int):
+    db = SessionLocal()
+    try:
+        # Run expiration checks before re-matching (Safeguard 1)
+        MatchingService.expire_waiting_donations(db)
+        # Trigger rematching (Safeguard 1)
+        MatchingService.run_rematching_for_demand(db, demand_id)
+    except Exception as e:
+        logger.error(f"Background re-matching task failed for demand {demand_id}: {e}")
+    finally:
+        db.close()
 
 # ----------------- PYDANTIC SCHEMAS -----------------
 
@@ -141,8 +155,28 @@ async def create_donation(
 
         # Run semantic matching safely in a try-catch block
         try:
-            from services.matching_service import MatchingService
             MatchingService.run_matching(db, donation)
+            # Re-fetch/query for active match count (Safeguard 2)
+            active_matches = db.query(models.DonationMatch).filter(
+                models.DonationMatch.donation_id == donation.id,
+                models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+                models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+            ).count()
+
+            if active_matches == 0:
+                donation.status = "WAITING_FOR_MATCH"
+                db.add(donation)
+                
+                # Add status history for transition
+                history_wait = models.DonationStatusHistory(
+                    donation_id=donation.id,
+                    old_status="ITEMS_SUBMITTED",
+                    new_status="WAITING_FOR_MATCH",
+                    changed_by_user_id=current_user.id,
+                    note="No immediate matches found. Donation is waiting for compatible NGO demands."
+                )
+                db.add(history_wait)
+                db.commit()
         except Exception as matching_err:
             logger.error(f"Semantic matching failed after successful donation persist for ID {donation.id}: {matching_err}")
 
@@ -170,9 +204,15 @@ async def send_ngo_request(
             detail="Only donors can send requests to NGOs."
         )
 
+    # Run expiration checks before donor selects an NGO match (Safeguard 1)
+    MatchingService.expire_waiting_donations(db)
+
     donation = db.query(models.Donation).filter(models.Donation.id == donation_id).with_for_update().first()
     if not donation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Donation record not found.")
+
+    if donation.status == "EXPIRED":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This donation has expired and cannot be requested.")
 
     if donation.donor_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not own this donation record.")
@@ -191,7 +231,6 @@ async def send_ngo_request(
         models.DonationMatch.ngo_id == ngo_user.ngo_profile.id
     ).first()
     if not match_rec:
-        from services.matching_service import MatchingService
         MatchingService.run_matching(db, donation)
         match_rec = db.query(models.DonationMatch).filter(
             models.DonationMatch.donation_id == donation_id,
@@ -582,6 +621,9 @@ async def list_donations(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # Run expiration checks on donations list load (Safeguard 1)
+    MatchingService.expire_waiting_donations(db)
+
     if current_user.role == models.UserRole.DONOR:
         donations = db.query(models.Donation).filter(models.Donation.donor_id == current_user.id).order_by(models.Donation.created_at.desc()).all()
     elif current_user.role == models.UserRole.NGO:
@@ -599,13 +641,23 @@ async def list_donations(
         
         items_summary = [{"id": it.id, "label": it.item_name, "category": it.category, "quantity": it.quantity, "condition": it.condition} for it in d.items]
         
+        # Calculate active matches count for metadata (Safeguard 2)
+        active_match_count = db.query(models.DonationMatch).filter(
+            models.DonationMatch.donation_id == d.id,
+            models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+            models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+        ).count()
+        has_available_matches = active_match_count > 0
+
         res.append({
             "id": str(d.id),
             "status": d.status,
             "date": d.created_at.strftime("%Y-%m-%d") if d.created_at else "—",
             "ngoName": ngo_name,
             "items": items_summary,
-            "beneficiaries": sum(it.quantity for it in d.items) * 3
+            "beneficiaries": sum(it.quantity for it in d.items) * 3,
+            "active_match_count": active_match_count,
+            "has_available_matches": has_available_matches
         })
     return res
 
@@ -661,6 +713,9 @@ async def track_donation(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # Run expiration checks on detail/track load (Safeguard 1)
+    MatchingService.expire_waiting_donations(db)
+
     donation = db.query(models.Donation).filter(models.Donation.id == donation_id).first()
     if not donation:
         raise HTTPException(status_code=404, detail="Donation record not found.")
@@ -668,10 +723,25 @@ async def track_donation(
     if current_user.id not in [donation.donor_id, donation.ngo_id] and current_user.role != models.UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="You do not own this donation.")
 
-    # Short human-readable labels mapping (Requirement 10)
+    # Calculate active matches count for metadata (Safeguard 2)
+    active_matches = db.query(models.DonationMatch).filter(
+        models.DonationMatch.donation_id == donation_id,
+        models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+        models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+    ).count()
+    has_available_matches = active_matches > 0
+
+    # Short human-readable labels mapping dynamically (Safeguard 4)
+    if donation.status == "ITEMS_SUBMITTED":
+        items_lbl = "New Match Available" if has_available_matches else "Items Submitted"
+    else:
+        items_lbl = "Items Submitted"
+
     STATUS_LABELS_MAP = {
         "DRAFT": "Items Submitted",
-        "ITEMS_SUBMITTED": "Items Submitted",
+        "ITEMS_SUBMITTED": items_lbl,
+        "WAITING_FOR_MATCH": "Waiting for NGO Match",
+        "EXPIRED": "Expired",
         "PENDING_NGO_RESPONSE": "Awaiting NGO",
         "NGO_ACCEPTED": "Accepted",
         "PACKAGING_IN_PROGRESS": "Packaging",
@@ -737,7 +807,6 @@ async def track_donation(
     } if pickup else None
 
     # Check if a real volunteer assignment exists (Requirement 10)
-    # Since we do not have a volunteers table, we return None (Volunteer not assigned yet)
     volunteer = None
 
     return {
@@ -749,7 +818,9 @@ async def track_donation(
         "pickup": pickup_details,
         "volunteer": volunteer,
         "events": events,
-        "beneficiaries": sum(it.quantity for it in donation.items) * 3
+        "beneficiaries": sum(it.quantity for it in donation.items) * 3,
+        "active_match_count": active_matches,
+        "has_available_matches": has_available_matches
     }
 
 # 11. Notifications list (JWT secured)
@@ -865,7 +936,6 @@ async def get_ngo_matches(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not own this donation record.")
 
     # Recalculate matches dynamically to capture newly created demands
-    from services.matching_service import MatchingService
     MatchingService.run_matching(db, donation)
     
     persisted_matches = db.query(models.DonationMatch).filter(
@@ -938,6 +1008,7 @@ async def get_ngo_matches(
 @router.post("/demands", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def create_ngo_demand(
     payload: NGODemandCreate,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -984,6 +1055,11 @@ async def create_ngo_demand(
             db.add(db_item)
 
         db.commit()
+        
+        # Trigger background re-matching task for open demand (Safeguards 1, 5, 6)
+        if demand.status == "OPEN":
+            background_tasks.add_task(rematch_demand_background, demand.id)
+
         return {"demand_id": demand.id, "title": demand.title, "status": demand.status}
 
     except Exception as e:
@@ -1051,6 +1127,7 @@ async def get_my_demands(
 async def update_ngo_demand(
     demand_id: int,
     payload: dict,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1070,16 +1147,35 @@ async def update_ngo_demand(
         raise HTTPException(status_code=403, detail="Access denied. NGO owns a different tenant registry.")
 
     try:
+        trigger_rematch = False
+
         if "status" in payload:
-            status_val = payload["status"]
-            # Map status
-            demand.status = "OPEN" if status_val == "Active" else "CLOSED"
+            new_status = "OPEN" if payload["status"] == "Active" else "CLOSED"
+            # status transitions to OPEN
+            if new_status == "OPEN" and demand.status != "OPEN":
+                trigger_rematch = True
+            demand.status = new_status
         if "priority" in payload:
+            if demand.priority != payload["priority"]:
+                trigger_rematch = True
             demand.priority = payload["priority"]
         if "description" in payload:
             demand.description = payload["description"]
+        if "title" in payload:
+            if demand.title != payload["title"]:
+                trigger_rematch = True
+            demand.title = payload["title"]
+        if "needed_by_date" in payload:
+            if str(demand.needed_by_date) != str(payload["needed_by_date"]):
+                trigger_rematch = True
+            demand.needed_by_date = payload["needed_by_date"]
         
         db.commit()
+
+        # Trigger background rematching only if matching-relevant fields changed and demand is open (Safeguards 1, 5, 6)
+        if trigger_rematch and demand.status == "OPEN":
+            background_tasks.add_task(rematch_demand_background, demand.id)
+
         return {"message": "Demand registry updated successfully."}
     except Exception as e:
         db.rollback()

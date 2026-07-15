@@ -31,6 +31,38 @@ def rematch_demand_background(demand_id: int):
     finally:
         db.close()
 
+def run_matching_background(donation_id: int, user_id: int):
+    db = SessionLocal()
+    try:
+        donation = db.query(models.Donation).filter(models.Donation.id == donation_id).first()
+        if donation:
+            MatchingService.run_matching(db, donation)
+            # Re-fetch/query for active match count (Safeguard 2)
+            active_matches = db.query(models.DonationMatch).filter(
+                models.DonationMatch.donation_id == donation.id,
+                models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+                models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+            ).count()
+
+            if active_matches == 0:
+                donation.status = "WAITING_FOR_MATCH"
+                db.add(donation)
+                
+                # Add status history for transition
+                history_wait = models.DonationStatusHistory(
+                    donation_id=donation.id,
+                    old_status="ITEMS_SUBMITTED",
+                    new_status="WAITING_FOR_MATCH",
+                    changed_by_user_id=user_id,
+                    note="No immediate matches found. Donation is waiting for compatible NGO demands."
+                )
+                db.add(history_wait)
+                db.commit()
+    except Exception as e:
+        logger.error(f"Background matching task failed for donation {donation_id}: {e}")
+    finally:
+        db.close()
+
 # ----------------- PYDANTIC SCHEMAS -----------------
 
 class DonationItemCreate(BaseModel):
@@ -86,6 +118,7 @@ class NGODemandCreate(BaseModel):
 @router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def create_donation(
     payload: DonationCreate,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -153,32 +186,8 @@ async def create_donation(
         db.add(history)
         db.commit()
 
-        # Run semantic matching safely in a try-catch block
-        try:
-            MatchingService.run_matching(db, donation)
-            # Re-fetch/query for active match count (Safeguard 2)
-            active_matches = db.query(models.DonationMatch).filter(
-                models.DonationMatch.donation_id == donation.id,
-                models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
-                models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
-            ).count()
-
-            if active_matches == 0:
-                donation.status = "WAITING_FOR_MATCH"
-                db.add(donation)
-                
-                # Add status history for transition
-                history_wait = models.DonationStatusHistory(
-                    donation_id=donation.id,
-                    old_status="ITEMS_SUBMITTED",
-                    new_status="WAITING_FOR_MATCH",
-                    changed_by_user_id=current_user.id,
-                    note="No immediate matches found. Donation is waiting for compatible NGO demands."
-                )
-                db.add(history_wait)
-                db.commit()
-        except Exception as matching_err:
-            logger.error(f"Semantic matching failed after successful donation persist for ID {donation.id}: {matching_err}")
+        # Run semantic matching asynchronously in background
+        background_tasks.add_task(run_matching_background, donation.id, current_user.id)
 
         return {"donation_id": donation.id, "status": donation.status}
 
@@ -342,10 +351,11 @@ async def accept_donation_request(
 
         # Notify Donor
         ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO"
+        items_summary = ", ".join([f"{it.item_name} (x{it.quantity})" for it in donation.items])
         notification = models.Notification(
             user_id=req.donor_id,
             title="Donation Request Accepted!",
-            message=f"Your donation request has been accepted by {ngo_name}. You can now prepare items for pickup.",
+            message=f"Your donation containing {items_summary} has been accepted by {ngo_name}. You can now prepare items for pickup.",
             type="ACCEPT",
             related_request_id=donation.id
         )
@@ -401,10 +411,11 @@ async def reject_donation_request(
 
         # Notify Donor
         ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO"
+        items_summary = ", ".join([f"{it.item_name} (x{it.quantity})" for it in donation.items])
         notification = models.Notification(
             user_id=req.donor_id,
             title="Donation Request Declined",
-            message=f"{ngo_name} could not accept this donation. Please select another matched NGO.",
+            message=f"{ngo_name} could not accept your donation containing {items_summary}. Please select another matched NGO.",
             type="REJECT",
             related_request_id=donation.id
         )
@@ -649,6 +660,20 @@ async def list_donations(
         ).count()
         has_available_matches = active_match_count > 0
 
+        # Self-heal status transition if active matches exist (Safeguard 3)
+        if d.status == "WAITING_FOR_MATCH" and has_available_matches:
+            d.status = "ITEMS_SUBMITTED"
+            db.add(d)
+            history = models.DonationStatusHistory(
+                donation_id=d.id,
+                old_status="WAITING_FOR_MATCH",
+                new_status="ITEMS_SUBMITTED",
+                changed_by_user_id=d.donor_id,
+                note="Status transitioned to ITEMS_SUBMITTED because active matches exist."
+            )
+            db.add(history)
+            db.flush()
+
         res.append({
             "id": str(d.id),
             "status": d.status,
@@ -659,6 +684,7 @@ async def list_donations(
             "active_match_count": active_match_count,
             "has_available_matches": has_available_matches
         })
+    db.commit()
     return res
 
 # 9. NGO Incoming requests
@@ -730,6 +756,20 @@ async def track_donation(
         models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
     ).count()
     has_available_matches = active_matches > 0
+
+    # Self-heal status transition if active matches exist (Safeguard 3)
+    if donation.status == "WAITING_FOR_MATCH" and has_available_matches:
+        donation.status = "ITEMS_SUBMITTED"
+        db.add(donation)
+        history = models.DonationStatusHistory(
+            donation_id=donation.id,
+            old_status="WAITING_FOR_MATCH",
+            new_status="ITEMS_SUBMITTED",
+            changed_by_user_id=donation.donor_id,
+            note="Status transitioned to ITEMS_SUBMITTED because active matches exist."
+        )
+        db.add(history)
+        db.commit()
 
     # Short human-readable labels mapping dynamically (Safeguard 4)
     if donation.status == "ITEMS_SUBMITTED":
@@ -937,6 +977,25 @@ async def get_ngo_matches(
 
     # Recalculate matches dynamically to capture newly created demands
     MatchingService.run_matching(db, donation)
+
+    # Self-heal status transition if active matches exist (Safeguard 3)
+    active_matches_count = db.query(models.DonationMatch).filter(
+        models.DonationMatch.donation_id == donation.id,
+        models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+        models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+    ).count()
+    if donation.status == "WAITING_FOR_MATCH" and active_matches_count > 0:
+        donation.status = "ITEMS_SUBMITTED"
+        db.add(donation)
+        history = models.DonationStatusHistory(
+            donation_id=donation.id,
+            old_status="WAITING_FOR_MATCH",
+            new_status="ITEMS_SUBMITTED",
+            changed_by_user_id=donation.donor_id,
+            note="Status transitioned to ITEMS_SUBMITTED because active matches exist."
+        )
+        db.add(history)
+        db.commit()
     
     persisted_matches = db.query(models.DonationMatch).filter(
         models.DonationMatch.donation_id == donation.id
@@ -1068,6 +1127,9 @@ async def create_ngo_demand(
         raise HTTPException(status_code=500, detail="Failed to create demand record.")
 
 
+
+
+
 # Fetch NGO Demands (scoped to authenticated NGO's tenant)
 @router.get("/demands/my", response_model=list)
 async def get_my_demands(
@@ -1122,6 +1184,53 @@ async def get_my_demands(
     return res
 
 
+# Fetch single NGO Demand details (scoped to authenticated NGO's tenant)
+@router.get("/demands/{demand_id}", response_model=dict)
+async def get_demand_details(
+    demand_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != models.UserRole.NGO:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    ngo_profile = current_user.ngo_profile
+    if not ngo_profile or not ngo_profile.tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant context not found.")
+
+    demand = db.query(models.NGODemand).filter(
+        models.NGODemand.id == demand_id,
+        models.NGODemand.tenant_id == ngo_profile.tenant_id
+    ).first()
+
+    if not demand:
+        raise HTTPException(status_code=404, detail="Demand registry not found.")
+
+    items_data = [
+        {
+            "id": str(it.id),
+            "item_name": it.item_name,
+            "category": it.category,
+            "quantity_needed": it.quantity_needed,
+            "quantity_fulfilled": it.quantity_fulfilled,
+            "minimum_condition": it.minimum_condition or "",
+        }
+        for it in demand.items
+    ]
+
+    return {
+        "id": str(demand.id),
+        "title": demand.title,
+        "description": demand.description or "",
+        "city": demand.city or "",
+        "priority": demand.priority,
+        "status": "Active" if demand.status == "OPEN" else "Paused",
+        "db_status": demand.status,
+        "expiryDate": demand.needed_by_date.strftime("%Y-%m-%d") if demand.needed_by_date else "",
+        "items": items_data,
+    }
+
+
 # Update/Pause Demand (tenant scoped)
 @router.put("/demands/{demand_id}", response_model=dict)
 async def update_ngo_demand(
@@ -1169,6 +1278,77 @@ async def update_ngo_demand(
             if str(demand.needed_by_date) != str(payload["needed_by_date"]):
                 trigger_rematch = True
             demand.needed_by_date = payload["needed_by_date"]
+
+        # Track audit history updated_at timestamp
+        demand.updated_at = func.now()
+
+        # Handle items updates, deleting removed ones and adding new ones, regenerating embeddings for changed ones
+        if "items" in payload:
+            db_items = {it.id: it for it in demand.items}
+            payload_ids = set()
+
+            for item_payload in payload["items"]:
+                item_id = item_payload.get("id")
+                # Parse conditions
+                min_cond = item_payload.get("minimum_condition")
+                if not min_cond and item_payload.get("acceptable_conditions"):
+                    min_cond = ",".join(item_payload["acceptable_conditions"])
+
+                new_name = item_payload["item_name"].strip()
+                new_category = item_payload["category"]
+                new_qty = item_payload["quantity_needed"]
+
+                db_item = None
+                if item_id is not None:
+                    try:
+                        item_id_val = int(item_id)
+                        if item_id_val in db_items:
+                            db_item = db_items[item_id_val]
+                            payload_ids.add(item_id_val)
+                    except ValueError:
+                        pass
+
+                if db_item:
+                    # Check if name or category changed to regenerate embedding
+                    if db_item.item_name != new_name or db_item.category != new_category:
+                        db_item.embedding = None
+                        normalized_text = MatchingService.normalize_text(new_name, new_category)
+                        emb = MatchingService.get_embedding(normalized_text)
+                        if emb:
+                            db_item.embedding = emb
+                        trigger_rematch = True
+
+                    if db_item.quantity_needed != new_qty or db_item.minimum_condition != min_cond:
+                        trigger_rematch = True
+
+                    db_item.item_name = new_name
+                    db_item.category = new_category
+                    db_item.quantity_needed = new_qty
+                    db_item.minimum_condition = min_cond
+                    db.add(db_item)
+                else:
+                    # Create new item
+                    db_item = models.NGODemandItem(
+                        demand_id=demand.id,
+                        item_name=new_name,
+                        category=new_category,
+                        quantity_needed=new_qty,
+                        quantity_fulfilled=0,
+                        minimum_condition=min_cond
+                    )
+                    # Generate embedding immediately
+                    normalized_text = MatchingService.normalize_text(new_name, new_category)
+                    emb = MatchingService.get_embedding(normalized_text)
+                    if emb:
+                        db_item.embedding = emb
+                    db.add(db_item)
+                    trigger_rematch = True
+
+            # Delete any existing items that were removed
+            for existing_id, existing_item in db_items.items():
+                if existing_id not in payload_ids:
+                    db.delete(existing_item)
+                    trigger_rematch = True
         
         db.commit()
 

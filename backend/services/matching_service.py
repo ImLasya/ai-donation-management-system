@@ -57,6 +57,20 @@ class MatchingService:
 
         return f"{n} {c}"
 
+    @classmethod
+    def normalize_name_only(cls, item_name: str) -> str:
+        """
+        Normalize item name by converting to lowercase, trimming,
+        and applying basic singularization to normalize plural words safely.
+        """
+        n = item_name.lower().strip()
+        if n.endswith("s") and not n.endswith("ss") and len(n) > 3:
+            if n.endswith("es") and n[:-2].endswith(("ch", "sh", "x", "z", "s")):
+                n = n[:-2]
+            else:
+                n = n[:-1]
+        return n
+
     @staticmethod
     def get_embedding(text: str) -> list:
         """
@@ -168,10 +182,13 @@ class MatchingService:
             condition_text = "compatible"
 
             d_norm = cls.normalize_text(d_item.item_name, d_item.category)
+            d_name_only = cls.normalize_name_only(d_item.item_name)
 
             for dem_item, rem in valid_demand_items:
                 dem_norm = cls.normalize_text(dem_item.item_name, dem_item.category)
-                if d_norm == dem_norm:
+                dem_name_only = cls.normalize_name_only(dem_item.item_name)
+                
+                if d_norm == dem_norm or d_name_only == dem_name_only:
                     sim = 1.0
                     match_type = "EXACT"
                 else:
@@ -350,6 +367,12 @@ class MatchingService:
         """
         Run the semantic matching engine for a given donation.
         """
+        # Check model availability (Safeguard)
+        model = SentenceTransformerSingleton().model
+        if model is None:
+            logger.error("SentenceTransformer model is unavailable. Cannot run matching.")
+            return False
+
         try:
             logger.info(f"Running matching for donation {donation.id}...")
             
@@ -377,6 +400,12 @@ class MatchingService:
         """
         Runs matching specifically for a single demand against all eligible candidate waiting donations.
         """
+        # Check model availability (Safeguard)
+        model = SentenceTransformerSingleton().model
+        if model is None:
+            logger.error("SentenceTransformer model is unavailable. Cannot run re-matching.")
+            return False
+
         try:
             demand = db.query(models.NGODemand).filter(models.NGODemand.id == demand_id).first()
             if not demand:

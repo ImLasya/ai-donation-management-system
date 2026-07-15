@@ -15,6 +15,7 @@ import {
   MapPin,
   Calendar,
   Package,
+  Edit,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -344,6 +345,15 @@ function DemandsIndex() {
                       ) : (
                         <Pause className="h-4 w-4" />
                       )}
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      aria-label="Edit demand"
+                      id={`edit-demand-${d.id}`}
+                      onClick={() => navigate({ to: "/ngo/demands/new", search: { edit_id: d.id } })}
+                    >
+                      <Edit className="h-4 w-4 text-muted-foreground" />
                     </Button>
                     <Button
                       size="icon"

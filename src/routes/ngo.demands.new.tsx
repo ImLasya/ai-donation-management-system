@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { DashboardShell } from "@/components/portal/DashboardShell";
 import { PageHeader } from "@/components/shared/ui";
 import { Card } from "@/components/ui/card";
@@ -19,6 +19,11 @@ import { toast } from "sonner";
 import { PlusCircle, Trash2, Package, AlertCircle } from "lucide-react";
 
 export const Route = createFileRoute("/ngo/demands/new")({
+  validateSearch: (search: Record<string, unknown>) => {
+    return {
+      edit_id: search.edit_id as string | undefined,
+    };
+  },
   head: () => ({ meta: [{ title: "Create Demand — Donate" }] }),
   component: NewDemand,
 });
@@ -50,6 +55,7 @@ const emptyItem = (): DemandItemRow => ({
 
 function NewDemand() {
   const navigate = useNavigate();
+  const { edit_id } = Route.useSearch();
   const [submitting, setSubmitting] = useState(false);
 
   const [title, setTitle] = useState("");
@@ -58,6 +64,42 @@ function NewDemand() {
   const [neededBy, setNeededBy] = useState("");
   const [items, setItems] = useState<DemandItemRow[]>([emptyItem()]);
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!edit_id) return;
+    const loadDemand = async () => {
+      try {
+        const token = localStorage.getItem("da_token");
+        const res = await fetch(
+          `${import.meta.env.VITE_API_BASE_URL}/api/donations/demands/${edit_id}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) throw new Error("Failed to load demand details.");
+        const data = await res.json();
+        setTitle(data.title);
+        setDescription(data.description || "");
+        setPriority(data.priority as Priority);
+        setNeededBy(data.expiryDate || "");
+        if (data.items && data.items.length > 0) {
+          setItems(
+            data.items.map((it: any) => ({
+              id: Number(it.id),
+              item_name: it.item_name,
+              category: it.category,
+              quantity_needed: it.quantity_needed,
+              acceptable_conditions: it.minimum_condition
+                ? (it.minimum_condition.split(",") as Condition[])
+                : ["NEW", "GOOD"],
+            }))
+          );
+        }
+      } catch (err) {
+        console.error(err);
+        toast.error("Failed to load demand for editing.");
+      }
+    };
+    loadDemand();
+  }, [edit_id]);
 
   // --- Item helpers ---
   const addItem = () => setItems((prev) => [...prev, emptyItem()]);
@@ -118,9 +160,10 @@ function NewDemand() {
       title: title.trim(),
       description: description.trim() || undefined,
       priority,
-      needed_by: neededBy || undefined,
-      status: "OPEN",
+      needed_by_date: neededBy || undefined,
+      status: "Active", // will map to OPEN on backend
       items: items.map((it) => ({
+        id: it.id,
         item_name: it.item_name.trim(),
         category: it.category,
         quantity_needed: it.quantity_needed,
@@ -130,29 +173,31 @@ function NewDemand() {
 
     try {
       const token = localStorage.getItem("da_token");
-      const res = await fetch(
-        `${import.meta.env.VITE_API_BASE_URL}/api/donations/demands`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(payload),
-        }
-      );
+      const url = edit_id
+        ? `${import.meta.env.VITE_API_BASE_URL}/api/donations/demands/${edit_id}`
+        : `${import.meta.env.VITE_API_BASE_URL}/api/donations/demands`;
+      
+      const method = edit_id ? "PUT" : "POST";
+
+      const res = await fetch(url, {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Server error: ${res.status}`);
       }
 
-      const data = await res.json();
-      toast.success(`Demand "${data.title || title}" created successfully!`);
+      toast.success(edit_id ? "Demand updated successfully!" : "Demand created successfully!");
       navigate({ to: "/ngo/demands" });
     } catch (err) {
       console.error(err);
-      toast.error(err instanceof Error ? err.message : "Failed to create demand.");
+      toast.error(err instanceof Error ? err.message : `Failed to ${edit_id ? 'update' : 'create'} demand.`);
     } finally {
       setSubmitting(false);
     }
@@ -161,8 +206,8 @@ function NewDemand() {
   return (
     <DashboardShell role="ngo">
       <PageHeader
-        title="Create Demand"
-        subtitle="Define what items your NGO currently needs."
+        title={edit_id ? "Edit Demand" : "Create Demand"}
+        subtitle={edit_id ? "Modify your current needed items list." : "Define what items your NGO currently needs."}
       />
 
       <form onSubmit={handleSubmit} noValidate className="space-y-6 max-w-3xl">
@@ -426,7 +471,7 @@ function NewDemand() {
                 Submitting…
               </span>
             ) : (
-              "Submit Demand"
+              edit_id ? "Save Changes" : "Submit Demand"
             )}
           </Button>
           <Button

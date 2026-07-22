@@ -25,7 +25,6 @@ import { Route as RegisterNgoRouteImport } from './routes/register.ngo'
 import { Route as RegisterDonorRouteImport } from './routes/register.donor'
 import { Route as NgoProfileRouteImport } from './routes/ngo.profile'
 import { Route as NgoNotificationsRouteImport } from './routes/ngo.notifications'
-import { Route as NgoInventoryRouteImport } from './routes/ngo.inventory'
 import { Route as NgoIncomingRouteImport } from './routes/ngo.incoming'
 import { Route as NgoDemandsRouteImport } from './routes/ngo.demands'
 import { Route as NgoDashboardRouteImport } from './routes/ngo.dashboard'
@@ -128,11 +127,6 @@ const NgoProfileRoute = NgoProfileRouteImport.update({
 const NgoNotificationsRoute = NgoNotificationsRouteImport.update({
   id: '/notifications',
   path: '/notifications',
-  getParentRoute: () => NgoRoute,
-} as any)
-const NgoInventoryRoute = NgoInventoryRouteImport.update({
-  id: '/inventory',
-  path: '/inventory',
   getParentRoute: () => NgoRoute,
 } as any)
 const NgoIncomingRoute = NgoIncomingRouteImport.update({
@@ -282,7 +276,6 @@ export interface FileRoutesByFullPath {
   '/ngo/dashboard': typeof NgoDashboardRoute
   '/ngo/demands': typeof NgoDemandsRouteWithChildren
   '/ngo/incoming': typeof NgoIncomingRoute
-  '/ngo/inventory': typeof NgoInventoryRoute
   '/ngo/notifications': typeof NgoNotificationsRoute
   '/ngo/profile': typeof NgoProfileRoute
   '/register/donor': typeof RegisterDonorRoute
@@ -322,7 +315,6 @@ export interface FileRoutesByTo {
   '/donor/schedule': typeof DonorScheduleRoute
   '/ngo/dashboard': typeof NgoDashboardRoute
   '/ngo/incoming': typeof NgoIncomingRoute
-  '/ngo/inventory': typeof NgoInventoryRoute
   '/ngo/notifications': typeof NgoNotificationsRoute
   '/ngo/profile': typeof NgoProfileRoute
   '/register/donor': typeof RegisterDonorRoute
@@ -365,7 +357,6 @@ export interface FileRoutesById {
   '/ngo/dashboard': typeof NgoDashboardRoute
   '/ngo/demands': typeof NgoDemandsRouteWithChildren
   '/ngo/incoming': typeof NgoIncomingRoute
-  '/ngo/inventory': typeof NgoInventoryRoute
   '/ngo/notifications': typeof NgoNotificationsRoute
   '/ngo/profile': typeof NgoProfileRoute
   '/register/donor': typeof RegisterDonorRoute
@@ -409,7 +400,6 @@ export interface FileRouteTypes {
     | '/ngo/dashboard'
     | '/ngo/demands'
     | '/ngo/incoming'
-    | '/ngo/inventory'
     | '/ngo/notifications'
     | '/ngo/profile'
     | '/register/donor'
@@ -449,7 +439,6 @@ export interface FileRouteTypes {
     | '/donor/schedule'
     | '/ngo/dashboard'
     | '/ngo/incoming'
-    | '/ngo/inventory'
     | '/ngo/notifications'
     | '/ngo/profile'
     | '/register/donor'
@@ -491,7 +480,6 @@ export interface FileRouteTypes {
     | '/ngo/dashboard'
     | '/ngo/demands'
     | '/ngo/incoming'
-    | '/ngo/inventory'
     | '/ngo/notifications'
     | '/ngo/profile'
     | '/register/donor'
@@ -629,13 +617,6 @@ declare module '@tanstack/react-router' {
       path: '/notifications'
       fullPath: '/ngo/notifications'
       preLoaderRoute: typeof NgoNotificationsRouteImport
-      parentRoute: typeof NgoRoute
-    }
-    '/ngo/inventory': {
-      id: '/ngo/inventory'
-      path: '/inventory'
-      fullPath: '/ngo/inventory'
-      preLoaderRoute: typeof NgoInventoryRouteImport
       parentRoute: typeof NgoRoute
     }
     '/ngo/incoming': {
@@ -882,7 +863,6 @@ interface NgoRouteChildren {
   NgoDashboardRoute: typeof NgoDashboardRoute
   NgoDemandsRoute: typeof NgoDemandsRouteWithChildren
   NgoIncomingRoute: typeof NgoIncomingRoute
-  NgoInventoryRoute: typeof NgoInventoryRoute
   NgoNotificationsRoute: typeof NgoNotificationsRoute
   NgoProfileRoute: typeof NgoProfileRoute
 }
@@ -891,7 +871,6 @@ const NgoRouteChildren: NgoRouteChildren = {
   NgoDashboardRoute: NgoDashboardRoute,
   NgoDemandsRoute: NgoDemandsRouteWithChildren,
   NgoIncomingRoute: NgoIncomingRoute,
-  NgoInventoryRoute: NgoInventoryRoute,
   NgoNotificationsRoute: NgoNotificationsRoute,
   NgoProfileRoute: NgoProfileRoute,
 }

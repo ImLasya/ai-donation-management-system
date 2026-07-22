@@ -129,6 +129,25 @@ export const donationService = {
         unlockedAt: a.unlocked_at,
       })),
     };
+  },
+  getDonorDashboardStats: async (): Promise<any> => {
+    if (MOCK_MODE) {
+      await delay(200);
+      return {
+        totalDonations: 12,
+        activeDonations: 2,
+        completedDonations: 10,
+        waitingForMatch: 0,
+        newMatchesAvailable: 1,
+        upcomingPickups: [
+          { donationId: "1", date: "2026-07-21", timeSlot: "10:00 AM - 12:00 PM", ngoName: "Save the Children", address: "123 Main St", phone: "555-0199" }
+        ],
+        recentActivity: [
+          { donationId: "1", oldStatus: "NGO_ACCEPTED", newStatus: "PACKAGING_IN_PROGRESS", timestamp: "2026-07-20 12:00", note: "Packaging started." }
+        ]
+      };
+    }
+    return apiRequest<any>("/donations/donor/dashboard-stats");
   }
 };
 

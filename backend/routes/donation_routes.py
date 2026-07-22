@@ -13,6 +13,7 @@ from routes.auth_routes import get_current_user
 import models
 from config import settings
 from services.matching_service import MatchingService
+from services.email_service import EmailService
 
 # Configure logger
 logger = logging.getLogger("uvicorn.error")
@@ -93,6 +94,7 @@ class PickupScheduleCreate(BaseModel):
 class PackagingRecordCreate(BaseModel):
     package_count: int = Field(1, gt=0)
     packaging_notes: Optional[str] = None
+    completed_items: Optional[List[str]] = None
 
 # Demand registry schemas
 class NGODemandItemCreate(BaseModel):
@@ -313,6 +315,7 @@ async def send_ngo_request(
 @router.post("/requests/{request_id}/accept", response_model=dict)
 async def accept_donation_request(
     request_id: int,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -340,27 +343,60 @@ async def accept_donation_request(
         old_status = donation.status
         donation.status = "NGO_ACCEPTED"
 
-        history = models.DonationStatusHistory(
-            donation_id=donation.id,
-            old_status=old_status,
-            new_status="NGO_ACCEPTED",
-            changed_by_user_id=current_user.id,
-            note="Request accepted by NGO. Packaging unlocked."
-        )
-        db.add(history)
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != "NGO_ACCEPTED":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="NGO_ACCEPTED",
+                changed_by_user_id=current_user.id,
+                note="Request accepted by NGO. Packaging unlocked."
+            )
+            db.add(history)
 
         # Notify Donor
+        donor_user = db.query(models.User).filter(models.User.id == req.donor_id).first()
         ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO"
         items_summary = ", ".join([f"{it.item_name} (x{it.quantity})" for it in donation.items])
-        notification = models.Notification(
-            user_id=req.donor_id,
-            title="Donation Request Accepted!",
-            message=f"Your donation containing {items_summary} has been accepted by {ngo_name}. You can now prepare items for pickup.",
-            type="ACCEPT",
-            related_request_id=donation.id
-        )
-        db.add(notification)
+        
+        if donor_user and donor_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=req.donor_id,
+                title="Donation Request Accepted!",
+                message=f"Your donation containing {items_summary} has been accepted by {ngo_name}. You can now prepare items for pickup.",
+                type="ACCEPT",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+            
         db.commit()
+
+        # Asynchronously send email notification after commit
+        if donor_user and donor_user.email_notifications_enabled:
+            def send_email_task():
+                items_li_html = "".join([f"<li>{it.item_name} (x{it.quantity})</li>" for it in donation.items])
+                replacements = {
+                    "donor_name": donor_user.donor_profile.full_name if donor_user.donor_profile else "Donor",
+                    "ngo_name": ngo_name,
+                    "items_list": items_li_html,
+                    "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/packaging"
+                }
+                html_body = EmailService.load_template("donation_accepted.html", replacements)
+                text_fallback = (
+                    f"Your donation request has been accepted by {ngo_name}! "
+                    f"Please log in and proceed to the packaging checklist for items: {items_summary}."
+                )
+                EmailService.send_html_email(
+                    to_email=donor_user.email,
+                    subject="Your Donation Has Been Accepted - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+            background_tasks.add_task(send_email_task)
 
         return {"message": "Donation request accepted."}
 
@@ -373,6 +409,7 @@ async def accept_donation_request(
 @router.post("/requests/{request_id}/reject", response_model=dict)
 async def reject_donation_request(
     request_id: int,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -398,29 +435,79 @@ async def reject_donation_request(
     try:
         req.status = "REJECTED"
         old_status = donation.status
-        donation.status = "NGO_REJECTED"
+        ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO"
 
-        history = models.DonationStatusHistory(
-            donation_id=donation.id,
-            old_status=old_status,
-            new_status="NGO_REJECTED",
-            changed_by_user_id=current_user.id,
-            note="Request declined by NGO."
-        )
-        db.add(history)
+        # Check other active matches (Safeguard 2 / Intelligent Rejection Fallback)
+        active_matches = db.query(models.DonationMatch).filter(
+            models.DonationMatch.donation_id == donation.id,
+            models.DonationMatch.ngo_id != current_user.ngo_profile.id, # other than this NGO
+            models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+            models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+        ).count()
+
+        if active_matches > 0:
+            target_status = "ITEMS_SUBMITTED"
+            note = f"Request declined by {ngo_name}. Status reset to ITEMS_SUBMITTED because {active_matches} other matches are available."
+        else:
+            target_status = "WAITING_FOR_MATCH"
+            note = f"Request declined by {ngo_name}. Status reset to WAITING_FOR_MATCH as no other active matches are available."
+
+        donation.status = target_status
+        donation.ngo_id = None
+
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != target_status:
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status=target_status,
+                changed_by_user_id=current_user.id,
+                note=note
+            )
+            db.add(history)
 
         # Notify Donor
-        ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO"
+        donor_user = db.query(models.User).filter(models.User.id == req.donor_id).first()
         items_summary = ", ".join([f"{it.item_name} (x{it.quantity})" for it in donation.items])
-        notification = models.Notification(
-            user_id=req.donor_id,
-            title="Donation Request Declined",
-            message=f"{ngo_name} could not accept your donation containing {items_summary}. Please select another matched NGO.",
-            type="REJECT",
-            related_request_id=donation.id
-        )
-        db.add(notification)
+        
+        if donor_user and donor_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=req.donor_id,
+                title="Donation Request Declined",
+                message=f"{ngo_name} could not accept your donation containing {items_summary}. Please select another matched NGO.",
+                type="REJECT",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+            
         db.commit()
+
+        # Asynchronously send email notification after commit
+        if donor_user and donor_user.email_notifications_enabled:
+            def send_email_task():
+                items_li_html = "".join([f"<li>{it.item_name} (x{it.quantity})</li>" for it in donation.items])
+                replacements = {
+                    "donor_name": donor_user.donor_profile.full_name if donor_user.donor_profile else "Donor",
+                    "ngo_name": ngo_name,
+                    "items_list": items_li_html,
+                    "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/matches"
+                }
+                html_body = EmailService.load_template("donation_rejected.html", replacements)
+                text_fallback = (
+                    f"Your donation request containing {items_summary} was declined by {ngo_name}. "
+                    f"We have returned it to matching so you can select another NGO."
+                )
+                EmailService.send_html_email(
+                    to_email=donor_user.email,
+                    subject="Donation Request Update - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+            background_tasks.add_task(send_email_task)
 
         return {"message": "Donation request rejected."}
 
@@ -473,6 +560,7 @@ async def start_packaging(
 async def complete_packaging(
     donation_id: int,
     payload: PackagingRecordCreate,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -494,6 +582,9 @@ async def complete_packaging(
         )
 
     try:
+        import json
+        completed_items_str = json.dumps(payload.completed_items) if payload.completed_items is not None else None
+
         # Create or update packaging record
         pkg_rec = db.query(models.PackagingRecord).filter(models.PackagingRecord.donation_id == donation_id).first()
         if not pkg_rec:
@@ -502,38 +593,72 @@ async def complete_packaging(
                 packaging_status="COMPLETED",
                 package_count=payload.package_count,
                 packaging_notes=payload.packaging_notes,
-                completed_at=date.today()
+                completed_items=completed_items_str,
+                completed_at=func.now()
             )
             db.add(pkg_rec)
         else:
             pkg_rec.package_count = payload.package_count
             pkg_rec.packaging_notes = payload.packaging_notes
-            pkg_rec.completed_at = date.today()
+            pkg_rec.completed_items = completed_items_str
+            pkg_rec.completed_at = func.now()
 
         old_status = donation.status
         donation.status = "READY_FOR_PICKUP"
 
-        # Log history
-        history = models.DonationStatusHistory(
-            donation_id=donation.id,
-            old_status=old_status,
-            new_status="READY_FOR_PICKUP",
-            changed_by_user_id=current_user.id,
-            note=f"Items packaging complete. Total package count: {payload.package_count}."
-        )
-        db.add(history)
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+        
+        if not last_history or last_history.new_status != "READY_FOR_PICKUP":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="READY_FOR_PICKUP",
+                changed_by_user_id=current_user.id,
+                note=f"Items packaging complete. Total package count: {payload.package_count}."
+            )
+            db.add(history)
 
         # Notify NGO
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
         donor_name = current_user.donor_profile.full_name if current_user.donor_profile else "Donor"
-        notification = models.Notification(
-            user_id=donation.ngo_id,
-            title="Donation Ready for Pickup",
-            message=f"{donor_name} completed packaging. Total packages: {payload.package_count}.",
-            type="PICKUP",
-            related_request_id=donation.id
-        )
-        db.add(notification)
+        
+        if ngo_user and ngo_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=donation.ngo_id,
+                title="Donation Ready for Pickup",
+                message=f"{donor_name} completed packaging. Total packages: {payload.package_count}.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+        
         db.commit()
+
+        # Asynchronously send email notification after transaction commit
+        if ngo_user and ngo_user.email_notifications_enabled:
+            def send_email_task():
+                replacements = {
+                    "donor_name": donor_name,
+                    "donation_id": donation.id,
+                    "package_count": payload.package_count,
+                    "packaging_notes": payload.packaging_notes or "None",
+                    "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                }
+                html_body = EmailService.load_template("packaging_complete.html", replacements)
+                text_fallback = (
+                    f"Donation Ready for Pickup: Donor {donor_name} completed packaging "
+                    f"for donation DON-{donation.id}. Total packages: {payload.package_count}."
+                )
+                EmailService.send_html_email(
+                    to_email=ngo_user.email,
+                    subject="Donation Ready for Pickup - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+            background_tasks.add_task(send_email_task)
 
         return {"message": "Donation marked as ready for pickup."}
 
@@ -542,16 +667,63 @@ async def complete_packaging(
         logger.error(f"Error completing packaging: {e}")
         raise HTTPException(status_code=500, detail="Failed to complete packaging.")
 
+# 6b. Get Packaging Checklist
+@router.get("/{donation_id}/packaging-checklist", response_model=dict)
+async def get_packaging_checklist(
+    donation_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(models.Donation).filter(models.Donation.id == donation_id).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found.")
+
+    if current_user.role == models.UserRole.DONOR and donation.donor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if current_user.role == models.UserRole.NGO and donation.ngo_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    # Get checklist tips
+    from services.packaging_service import PackagingService
+    categories = [it.category for it in donation.items if it.category]
+    checklist_tips = PackagingService.get_tips_for_categories(categories)
+
+    # Fetch previously saved completed items
+    pkg_rec = db.query(models.PackagingRecord).filter(models.PackagingRecord.donation_id == donation_id).first()
+    completed_items = []
+    package_count = 1
+    packaging_notes = ""
+    if pkg_rec:
+        import json
+        try:
+            completed_items = json.loads(pkg_rec.completed_items) if pkg_rec.completed_items else []
+        except:
+            completed_items = []
+        package_count = pkg_rec.package_count
+        packaging_notes = pkg_rec.packaging_notes or ""
+
+    return {
+        "checklist": checklist_tips,
+        "completedItems": completed_items,
+        "packageCount": package_count,
+        "packagingNotes": packaging_notes
+    }
+
 # 7. Schedule Pickup (READY_FOR_PICKUP -> PICKUP_SCHEDULED)
 @router.post("/{donation_id}/pickup", response_model=dict)
 async def schedule_pickup(
     donation_id: int,
     payload: PickupScheduleCreate,
+    background_tasks: BackgroundTasks,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     if current_user.role != models.UserRole.DONOR:
         raise HTTPException(status_code=403, detail="Only donors can schedule pickups.")
+
+    # Validate pickup date (prevent past dates)
+    if payload.pickup_date < date.today():
+        raise HTTPException(status_code=400, detail="Cannot schedule pickup in the past.")
 
     donation = db.query(models.Donation).filter(models.Donation.id == donation_id).with_for_update().first()
     if not donation:
@@ -579,45 +751,107 @@ async def schedule_pickup(
             time_slot=payload.time_slot,
             pickup_address=payload.pickup_address,
             contact_phone=payload.contact_phone,
-            notes=payload.notes
+            notes=payload.notes,
+            reminder_status="PENDING"
         )
         db.add(pickup)
 
         old_status = donation.status
         donation.status = "PICKUP_SCHEDULED"
 
-        # Log history
-        history = models.DonationStatusHistory(
-            donation_id=donation.id,
-            old_status=old_status,
-            new_status="PICKUP_SCHEDULED",
-            changed_by_user_id=current_user.id,
-            note=f"Pickup scheduled for {payload.pickup_date} at {payload.time_slot}."
-        )
-        db.add(history)
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != "PICKUP_SCHEDULED":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="PICKUP_SCHEDULED",
+                changed_by_user_id=current_user.id,
+                note=f"Pickup scheduled for {payload.pickup_date} at {payload.time_slot}."
+            )
+            db.add(history)
 
         # Notify NGO
-        notification_ngo = models.Notification(
-            user_id=donation.ngo_id,
-            title="Pickup Scheduled",
-            message=f"Pickup has been scheduled for {payload.pickup_date} at {payload.time_slot}.",
-            type="PICKUP",
-            related_request_id=donation.id
-        )
-        db.add(notification_ngo)
-
-        # Notify Donor
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
         ngo_org = db.query(models.NGOProfile).filter(models.NGOProfile.user_id == donation.ngo_id).first()
         org_name = ngo_org.organization_name if ngo_org else "NGO"
-        notification_donor = models.Notification(
-            user_id=current_user.id,
-            title="Pickup Confirmed",
-            message=f"Your pickup with {org_name} is scheduled successfully.",
-            type="PICKUP",
-            related_request_id=donation.id
-        )
-        db.add(notification_donor)
+
+        if ngo_user and ngo_user.inapp_notifications_enabled:
+            notification_ngo = models.Notification(
+                user_id=donation.ngo_id,
+                title="Pickup Scheduled",
+                message=f"Pickup has been scheduled for {payload.pickup_date} at {payload.time_slot}.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification_ngo)
+
+        # Notify Donor
+        if current_user.inapp_notifications_enabled:
+            notification_donor = models.Notification(
+                user_id=current_user.id,
+                title="Pickup Confirmed",
+                message=f"Your pickup with {org_name} is scheduled successfully.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification_donor)
+            
         db.commit()
+
+        # Asynchronously send email notification after commit
+        def send_emails_task():
+            replacements = {
+                "ngo_name": org_name,
+                "donation_id": donation.id,
+                "pickup_date": payload.pickup_date.strftime("%Y-%m-%d"),
+                "time_slot": payload.time_slot,
+                "address": payload.pickup_address,
+                "phone": payload.contact_phone,
+                "notes_li": f"<li><strong>Special Notes:</strong> {payload.notes}</li>" if payload.notes else "",
+                "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/track/{donation.id}"
+            }
+            html_body = EmailService.load_template("pickup_scheduled.html", replacements)
+            text_fallback = (
+                f"Donation Pickup Scheduled: Donation DON-{donation.id} scheduled with {org_name} "
+                f"for {payload.pickup_date} during slot {payload.time_slot}."
+            )
+
+            # Send to Donor
+            if current_user.email_notifications_enabled:
+                EmailService.send_html_email(
+                    to_email=current_user.email,
+                    subject="Pickup Scheduled - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+
+            # Send to NGO
+            if ngo_user and ngo_user.email_notifications_enabled:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                html_body_ngo = EmailService.load_template("pickup_scheduled.html", replacements)
+                EmailService.send_html_email(
+                    to_email=ngo_user.email,
+                    subject="Pickup Scheduled - Donate",
+                    html_body=html_body_ngo,
+                    text_fallback=text_fallback
+                )
+
+            # Send to Volunteer (if assigned)
+            if pickup and getattr(pickup, "volunteer_email", None):
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/login"
+                html_body_vol = EmailService.load_template("pickup_scheduled.html", replacements)
+                EmailService.send_html_email(
+                    to_email=pickup.volunteer_email,
+                    subject="Donation Pickup Scheduled - Donate",
+                    html_body=html_body_vol,
+                    text_fallback=text_fallback
+                )
+
+        background_tasks.add_task(send_emails_task)
 
         return {"message": "Pickup scheduled successfully."}
 
@@ -674,11 +908,37 @@ async def list_donations(
             db.add(history)
             db.flush()
 
+        # Fetch donor profile and pickup details if requested by NGO or admin
+        donor_name = "—"
+        donor_phone = ""
+        pickup_details = None
+        
+        donor_profile = db.query(models.DonorProfile).filter(models.DonorProfile.user_id == d.donor_id).first()
+        if donor_profile:
+            donor_name = donor_profile.full_name
+            donor_phone = donor_profile.phone or ""
+
+        pickup = d.pickup_schedule
+        if pickup:
+            pickup_details = {
+                "date": pickup.pickup_date.strftime("%Y-%m-%d"),
+                "timeSlot": pickup.time_slot,
+                "address": pickup.pickup_address,
+                "phone": pickup.contact_phone,
+                "notes": pickup.notes,
+                "volunteerName": pickup.volunteer_name,
+                "volunteerPhone": pickup.volunteer_phone,
+                "volunteerEmail": pickup.volunteer_email
+            }
+
         res.append({
             "id": str(d.id),
             "status": d.status,
             "date": d.created_at.strftime("%Y-%m-%d") if d.created_at else "—",
             "ngoName": ngo_name,
+            "donorName": donor_name,
+            "donorPhone": donor_phone,
+            "pickup": pickup_details,
             "items": items_summary,
             "beneficiaries": sum(it.quantity for it in d.items) * 3,
             "active_match_count": active_match_count,
@@ -778,17 +1038,20 @@ async def track_donation(
         items_lbl = "Items Submitted"
 
     STATUS_LABELS_MAP = {
-        "DRAFT": "Items Submitted",
+        "DRAFT": "Submitted",
         "ITEMS_SUBMITTED": items_lbl,
         "WAITING_FOR_MATCH": "Waiting for NGO Match",
         "EXPIRED": "Expired",
-        "PENDING_NGO_RESPONSE": "Awaiting NGO",
-        "NGO_ACCEPTED": "Accepted",
-        "PACKAGING_IN_PROGRESS": "Packaging",
-        "READY_FOR_PICKUP": "Ready",
-        "PICKUP_SCHEDULED": "Scheduled",
-        "PICKUP_IN_PROGRESS": "In Transit",
-        "COMPLETED": "Completed",
+        "PENDING_NGO_RESPONSE": "Awaiting NGO Response",
+        "NGO_ACCEPTED": "Accepted by NGO",
+        "PACKAGING_IN_PROGRESS": "Packaging In Progress",
+        "READY_FOR_PICKUP": "Ready for Pickup",
+        "PICKUP_SCHEDULED": "Pickup Scheduled",
+        "COLLECTED": "Collected (In Transit)",
+        "PICKUP_IN_PROGRESS": "Collected (In Transit)",
+        "DELIVERED": "Delivered to NGO",
+        "COMPLETED": "Delivered to NGO",
+        "ACKNOWLEDGED": "Acknowledged (Thank You)",
         "NGO_REJECTED": "Declined"
     }
 
@@ -812,7 +1075,7 @@ async def track_donation(
         })
 
     # Add future steps
-    workflow_steps = ["ITEMS_SUBMITTED", "PENDING_NGO_RESPONSE", "NGO_ACCEPTED", "PACKAGING_IN_PROGRESS", "READY_FOR_PICKUP", "PICKUP_SCHEDULED", "PICKUP_IN_PROGRESS", "COMPLETED"]
+    workflow_steps = ["ITEMS_SUBMITTED", "PENDING_NGO_RESPONSE", "NGO_ACCEPTED", "PACKAGING_IN_PROGRESS", "READY_FOR_PICKUP", "PICKUP_SCHEDULED", "COLLECTED", "DELIVERED", "ACKNOWLEDGED"]
     current_idx = workflow_steps.index(donation.status) if donation.status in workflow_steps else 0
 
     for i in range(current_idx + 1, len(workflow_steps)):
@@ -848,6 +1111,12 @@ async def track_donation(
 
     # Check if a real volunteer assignment exists (Requirement 10)
     volunteer = None
+    if pickup and (pickup.volunteer_name or pickup.volunteer_phone):
+        volunteer = {
+            "name": pickup.volunteer_name,
+            "phone": pickup.volunteer_phone,
+            "email": pickup.volunteer_email
+        }
 
     return {
         "id": str(donation.id),
@@ -1178,10 +1447,803 @@ async def get_my_demands(
             "category": first_item.category if first_item else "Other",
             "quantityRequired": first_item.quantity_needed if first_item else 0,
             "quantityFulfilled": first_item.quantity_fulfilled if first_item else 0,
-            # all items
             "items": items_data,
         })
     return res
+
+
+# 11b. Assign/Update Volunteer (NGO only)
+@router.post("/{donation_id}/assign-volunteer", response_model=dict)
+async def assign_volunteer(
+    donation_id: int,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(models.Donation).filter(models.Donation.id == donation_id).first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found.")
+
+    if current_user.role != models.UserRole.ADMIN and (current_user.role != models.UserRole.NGO or donation.ngo_id != current_user.id):
+        raise HTTPException(status_code=403, detail="Only the matched NGO or admin can assign a volunteer.")
+
+    pickup = donation.pickup_schedule
+    if not pickup:
+        raise HTTPException(status_code=400, detail="No pickup schedule exists yet. Donors must schedule it first.")
+
+    v_name = payload.get("volunteer_name", "").strip()
+    v_phone = payload.get("volunteer_phone", "").strip()
+    v_email = payload.get("volunteer_email", "").strip()
+
+    if not v_name or not v_phone or not v_email:
+        raise HTTPException(status_code=400, detail="Volunteer name, phone, and email are required.")
+
+    # Check if volunteer details actually changed (deduplication)
+    details_changed = (
+        pickup.volunteer_name != v_name or
+        pickup.volunteer_phone != v_phone or
+        pickup.volunteer_email != v_email
+    )
+
+    pickup.volunteer_name = v_name
+    pickup.volunteer_phone = v_phone
+    pickup.volunteer_email = v_email
+    db.add(pickup)
+
+    # Notify Donor in-app if details changed
+    donor_user = db.query(models.User).filter(models.User.id == donation.donor_id).first()
+    ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO Partner"
+
+    if details_changed and donor_user and donor_user.inapp_notifications_enabled:
+        notification = models.Notification(
+            user_id=donation.donor_id,
+            title="Courier Volunteer Assigned",
+            message=f"{ngo_name} has assigned volunteer {v_name} (Phone: {v_phone}) to pick up your donation DON-{donation.id}.",
+            type="PICKUP",
+            related_request_id=donation.id
+        )
+        db.add(notification)
+
+    db.commit()
+
+    # Asynchronously send email notifications after commit if details changed
+    if details_changed:
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
+        
+        def send_emails_task():
+            replacements = {
+                "ngo_name": ngo_name,
+                "donation_id": str(donation.id),
+                "volunteer_name": v_name,
+                "volunteer_phone": v_phone,
+                "pickup_date": pickup.pickup_date.strftime("%Y-%m-%d") if pickup.pickup_date else "—",
+                "time_slot": pickup.time_slot,
+                "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/track/{donation.id}"
+            }
+            html_body = EmailService.load_template("volunteer_assigned.html", replacements)
+            text_fallback = (
+                f"Hello,\n\nVolunteer {v_name} ({v_phone}) has been assigned by {ngo_name} to pick up your donation DON-{donation.id}.\n"
+                f"Scheduled Date: {pickup.pickup_date}\nSlot: {pickup.time_slot}.\n\nTrack: http://localhost:8080/donor/track/{donation.id}"
+            )
+            
+            # 1. Send to Donor
+            if donor_user and donor_user.email_notifications_enabled:
+                EmailService.send_html_email(donor_user.email, "Courier Volunteer Assigned - Donate", html_body, text_fallback)
+            
+            # 2. Send to NGO
+            if ngo_user and ngo_user.email_notifications_enabled:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                html_body_ngo = EmailService.load_template("volunteer_assigned.html", replacements)
+                EmailService.send_html_email(ngo_user.email, "Courier Volunteer Assigned - Donate", html_body_ngo, text_fallback)
+
+            # 3. Send to Volunteer
+            if v_email:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/login"
+                html_body_vol = EmailService.load_template("volunteer_assigned.html", replacements)
+                EmailService.send_html_email(v_email, "Courier Volunteer Assignment - Donate", html_body_vol, text_fallback)
+
+        background_tasks.add_task(send_emails_task)
+
+    return {"success": True, "message": f"Volunteer '{v_name}' assigned successfully."}
+
+
+# 12. Transit Donation (PICKUP_SCHEDULED -> COLLECTED)
+@router.post("/{donation_id}/transit", response_model=dict)
+async def mark_in_transit(
+    donation_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(models.Donation).filter(models.Donation.id == donation_id).with_for_update().first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found.")
+
+    # Authorization Check: only target NGO or Admin
+    if current_user.role != models.UserRole.ADMIN and (current_user.role != models.UserRole.NGO or donation.ngo_id != current_user.id):
+        raise HTTPException(status_code=403, detail="Only the matched NGO or admin can start collection transit.")
+
+    if donation.status != "PICKUP_SCHEDULED":
+        raise HTTPException(status_code=400, detail="Donation pickup is not scheduled yet.")
+
+    try:
+        old_status = donation.status
+        donation.status = "COLLECTED"
+
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != "COLLECTED":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="COLLECTED",
+                changed_by_user_id=current_user.id,
+                note="Donation collected and in transit to NGO facility."
+            )
+            db.add(history)
+
+        # Notify Donor
+        donor_user = db.query(models.User).filter(models.User.id == donation.donor_id).first()
+        ngo_name = current_user.ngo_profile.organization_name if current_user.role == models.UserRole.NGO and current_user.ngo_profile else "NGO Partner"
+
+        if donor_user and donor_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=donation.donor_id,
+                title="Donation Collected",
+                message=f"Your donation DON-{donation.id} has been collected by {ngo_name} and is in transit.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+
+        db.commit()
+
+        # Asynchronously send email notifications after commit
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
+        pickup = donation.pickup_schedule
+
+        def send_emails_task():
+            replacements = {
+                "donor_name": donor_user.donor_profile.full_name if donor_user and donor_user.donor_profile else "Donor",
+                "ngo_name": ngo_name,
+                "donation_id": donation.id,
+                "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/track/{donation.id}"
+            }
+            html_body = EmailService.load_template("donation_collected.html", replacements)
+            text_fallback = (
+                f"Donation Collected: Your donation DON-{donation.id} "
+                f"has been collected by {ngo_name} and is currently in transit."
+            )
+
+            # 1. Send to Donor
+            if donor_user and donor_user.email_notifications_enabled:
+                EmailService.send_html_email(
+                    to_email=donor_user.email,
+                    subject="Donation Collected - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+
+            # 2. Send to NGO
+            if ngo_user and ngo_user.email_notifications_enabled:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                html_body_ngo = EmailService.load_template("donation_collected.html", replacements)
+                EmailService.send_html_email(
+                    to_email=ngo_user.email,
+                    subject="Donation Collected - Donate",
+                    html_body=html_body_ngo,
+                    text_fallback=text_fallback
+                )
+
+            # 3. Send to Volunteer
+            if pickup and getattr(pickup, "volunteer_email", None):
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/login"
+                html_body_vol = EmailService.load_template("donation_collected.html", replacements)
+                EmailService.send_html_email(
+                    to_email=pickup.volunteer_email,
+                    subject="Upcoming Courier Pickup Transit - Donate",
+                    html_body=html_body_vol,
+                    text_fallback=text_fallback
+                )
+
+        background_tasks.add_task(send_emails_task)
+
+        return {"message": "Donation marked as collected and in transit."}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error marking in transit: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark in transit.")
+
+# 13. Complete Delivery (COLLECTED -> DELIVERED)
+@router.post("/{donation_id}/complete", response_model=dict)
+async def mark_delivered(
+    donation_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(models.Donation).filter(models.Donation.id == donation_id).with_for_update().first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found.")
+
+    # Authorization Check: only target NGO or Admin
+    if current_user.role != models.UserRole.ADMIN and (current_user.role != models.UserRole.NGO or donation.ngo_id != current_user.id):
+        raise HTTPException(status_code=403, detail="Only the matched NGO or admin can mark donation as delivered.")
+
+    if donation.status != "COLLECTED":
+        raise HTTPException(status_code=400, detail="Donation has not been collected/in-transit yet.")
+
+    try:
+        old_status = donation.status
+        donation.status = "DELIVERED"
+
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != "DELIVERED":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="DELIVERED",
+                changed_by_user_id=current_user.id,
+                note="Donation delivered successfully to NGO facility."
+            )
+            db.add(history)
+
+        # Notify Donor
+        donor_user = db.query(models.User).filter(models.User.id == donation.donor_id).first()
+        ngo_name = current_user.ngo_profile.organization_name if current_user.role == models.UserRole.NGO and current_user.ngo_profile else "NGO Partner"
+
+        if donor_user and donor_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=donation.donor_id,
+                title="Donation Delivered",
+                message=f"Your donation DON-{donation.id} has been delivered to {ngo_name}.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+
+        db.commit()
+
+        # Asynchronously send email notifications after commit
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
+
+        def send_emails_task():
+            items_li_html = "".join([f"<li>{it.item_name} (x{it.quantity})</li>" for it in donation.items])
+            replacements = {
+                "ngo_name": ngo_name,
+                "donation_id": donation.id,
+                "items_list": items_li_html,
+                "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/track/{donation.id}"
+            }
+            html_body = EmailService.load_template("donation_delivered.html", replacements)
+            text_fallback = (
+                f"Donation Delivered: Your donation DON-{donation.id} "
+                f"has been delivered to {ngo_name}."
+            )
+
+            # 1. Send to Donor
+            if donor_user and donor_user.email_notifications_enabled:
+                EmailService.send_html_email(
+                    to_email=donor_user.email,
+                    subject="Donation Safely Delivered - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+
+            # 2. Send to NGO
+            if ngo_user and ngo_user.email_notifications_enabled:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                html_body_ngo = EmailService.load_template("donation_delivered.html", replacements)
+                EmailService.send_html_email(
+                    to_email=ngo_user.email,
+                    subject="Donation Safely Delivered - Donate",
+                    html_body=html_body_ngo,
+                    text_fallback=text_fallback
+                )
+
+        background_tasks.add_task(send_emails_task)
+
+        return {"message": "Donation marked as delivered."}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error marking delivered: {e}")
+        raise HTTPException(status_code=500, detail="Failed to mark delivered.")
+
+# 14. Acknowledge Receipt (DELIVERED -> ACKNOWLEDGED)
+@router.post("/{donation_id}/acknowledge", response_model=dict)
+async def acknowledge_receipt(
+    donation_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    donation = db.query(models.Donation).filter(models.Donation.id == donation_id).with_for_update().first()
+    if not donation:
+        raise HTTPException(status_code=404, detail="Donation record not found.")
+
+    # Authorization Check: only target NGO can acknowledge
+    if current_user.role != models.UserRole.NGO or donation.ngo_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the matched NGO can acknowledge receipt.")
+
+    if donation.status != "DELIVERED":
+        raise HTTPException(status_code=400, detail="Donation has not been delivered to your facility yet.")
+
+    try:
+        old_status = donation.status
+        donation.status = "ACKNOWLEDGED"
+
+        # Concurrency guard: check duplicate history
+        last_history = db.query(models.DonationStatusHistory).filter(
+            models.DonationStatusHistory.donation_id == donation.id
+        ).order_by(models.DonationStatusHistory.created_at.desc()).first()
+
+        if not last_history or last_history.new_status != "ACKNOWLEDGED":
+            history = models.DonationStatusHistory(
+                donation_id=donation.id,
+                old_status=old_status,
+                new_status="ACKNOWLEDGED",
+                changed_by_user_id=current_user.id,
+                note="NGO acknowledged receipt of all items."
+            )
+            db.add(history)
+
+        # Notify Donor
+        donor_user = db.query(models.User).filter(models.User.id == donation.donor_id).first()
+        ngo_name = current_user.ngo_profile.organization_name if current_user.ngo_profile else "NGO Partner"
+
+        if donor_user and donor_user.inapp_notifications_enabled:
+            notification = models.Notification(
+                user_id=donation.donor_id,
+                title="Donation Acknowledged",
+                message=f"Thank you! {ngo_name} has acknowledged receipt of donation DON-{donation.id}.",
+                type="PICKUP",
+                related_request_id=donation.id
+            )
+            db.add(notification)
+
+        db.commit()
+
+        # Asynchronously send email notifications after commit
+        ngo_user = db.query(models.User).filter(models.User.id == donation.ngo_id).first()
+
+        def send_emails_task():
+            items_li_html = "".join([f"<li>{it.item_name} (x{it.quantity})</li>" for it in donation.items])
+            replacements = {
+                "donor_name": donor_user.donor_profile.full_name if donor_user and donor_user.donor_profile else "Donor",
+                "ngo_name": ngo_name,
+                "donation_id": donation.id,
+                "items_list": items_li_html,
+                "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/dashboard"
+            }
+            html_body = EmailService.load_template("donation_acknowledged.html", replacements)
+            text_fallback = (
+                f"Donation Acknowledged: Thank you! {ngo_name} "
+                f"has acknowledged receipt of donation DON-{donation.id}."
+            )
+
+            # 1. Send to Donor
+            if donor_user and donor_user.email_notifications_enabled:
+                EmailService.send_html_email(
+                    to_email=donor_user.email,
+                    subject="Donation Receipt Acknowledged - Donate",
+                    html_body=html_body,
+                    text_fallback=text_fallback
+                )
+
+            # 2. Send to NGO
+            if ngo_user and ngo_user.email_notifications_enabled:
+                replacements["action_url"] = f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                html_body_ngo = EmailService.load_template("donation_acknowledged.html", replacements)
+                EmailService.send_html_email(
+                    to_email=ngo_user.email,
+                    subject="Donation Receipt Acknowledged - Donate",
+                    html_body=html_body_ngo,
+                    text_fallback=text_fallback
+                )
+
+        background_tasks.add_task(send_emails_task)
+
+        return {"message": "Donation receipt acknowledged."}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error acknowledging receipt: {e}")
+        raise HTTPException(status_code=500, detail="Failed to acknowledge receipt.")
+
+# Debug: Test Email (POST /api/donations/debug/test-email)
+@router.post("/debug/test-email", response_model=dict)
+async def send_test_email(
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Sends a real HTML test email to the currently logged-in user's email address.
+    Use this endpoint to verify SMTP configuration is working correctly.
+    """
+    from datetime import datetime
+    replacements = {
+        "user_name": current_user.email,
+        "test_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/login"
+    }
+    html_body = EmailService.load_template("test_email.html", replacements)
+    if not html_body:
+        # Fallback inline if template is missing
+        html_body = f"""
+        <!DOCTYPE html>
+        <html><body style="font-family:sans-serif;padding:20px;">
+        <h2 style="color:#0d9488;">✅ SMTP Test Successful</h2>
+        <p>Hello <strong>{current_user.email}</strong>,</p>
+        <p>This test email confirms your SMTP configuration is working correctly.</p>
+        <p><small>Sent at: {replacements['test_time']}</small></p>
+        </body></html>
+        """
+
+    text_fallback = (
+        f"SMTP Test Email\n\n"
+        f"Hello {current_user.email},\n\n"
+        f"This test email confirms your SMTP configuration is working correctly.\n"
+        f"Sent at: {replacements['test_time']}"
+    )
+
+    status = EmailService.send_html_email(
+        to_email=current_user.email,
+        subject="SMTP Configuration Test - Donate",
+        html_body=html_body,
+        text_fallback=text_fallback
+    )
+
+    return {
+        "status": status,
+        "recipient": current_user.email,
+        "message": (
+            "Test email sent successfully. Check your inbox." if status == "SENT"
+            else "SMTP not configured. Email logged to console (DEVELOPMENT_LOG_ONLY)." if status == "DEVELOPMENT_LOG_ONLY"
+            else "Email delivery failed. Check SMTP credentials and server logs."
+        )
+    }
+
+
+# 15. Donor Dashboard Stats
+@router.get("/donor/dashboard-stats", response_model=dict)
+async def get_donor_dashboard_stats(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != models.UserRole.DONOR:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    # 1. Counts
+    total_donations_count = db.query(models.Donation).filter(models.Donation.donor_id == current_user.id).count()
+    
+    active_donations_count = db.query(models.Donation).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_([
+            "ITEMS_SUBMITTED", "PENDING_NGO_RESPONSE", "NGO_ACCEPTED",
+            "PACKAGING_IN_PROGRESS", "READY_FOR_PICKUP", "PICKUP_SCHEDULED", "COLLECTED", "DELIVERED",
+            "PICKUP_IN_PROGRESS"
+        ])
+    ).count()
+
+    completed_donations_count = db.query(models.Donation).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(["ACKNOWLEDGED", "COMPLETED"])
+    ).count()
+
+    waiting_for_match_count = db.query(models.Donation).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status == "WAITING_FOR_MATCH"
+    ).count()
+
+    # 2. Upcoming Pickups
+    upcoming_pickups = []
+    import datetime
+    today = datetime.date.today()
+    pickups = db.query(models.PickupSchedule).join(
+        models.Donation, models.Donation.id == models.PickupSchedule.donation_id
+    ).filter(
+        models.Donation.donor_id == current_user.id,
+        models.PickupSchedule.pickup_date >= today
+    ).order_by(models.PickupSchedule.pickup_date.asc()).all()
+
+    for p in pickups:
+        donation = p.donation
+        ngo_profile = db.query(models.NGOProfile).filter(models.NGOProfile.user_id == donation.ngo_id).first()
+        ngo_name = ngo_profile.organization_name if ngo_profile else "NGO Partner"
+        upcoming_pickups.append({
+            "donationId": str(donation.id),
+            "date": p.pickup_date.strftime("%Y-%m-%d"),
+            "timeSlot": p.time_slot,
+            "ngoName": ngo_name,
+            "address": p.pickup_address,
+            "phone": p.contact_phone
+        })
+
+    # 3. New matches available count
+    donations = db.query(models.Donation).filter(
+        models.Donation.donor_id == current_user.id,
+        models.Donation.status.in_(["ITEMS_SUBMITTED", "WAITING_FOR_MATCH"])
+    ).all()
+    
+    new_matches_available = 0
+    for d in donations:
+        has_matches = db.query(models.DonationMatch).filter(
+            models.DonationMatch.donation_id == d.id,
+            models.DonationMatch.status.in_(["ACTIVE", "NOTIFIED"]),
+            models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+        ).count() > 0
+        if has_matches:
+            new_matches_available += 1
+
+    # 4. Recent activity
+    recent_activity = []
+    activities = db.query(models.DonationStatusHistory).join(
+        models.Donation, models.Donation.id == models.DonationStatusHistory.donation_id
+    ).filter(
+        models.Donation.donor_id == current_user.id
+    ).order_by(models.DonationStatusHistory.created_at.desc()).limit(5).all()
+
+    for a in activities:
+        recent_activity.append({
+            "donationId": str(a.donation_id),
+            "oldStatus": a.old_status,
+            "newStatus": a.new_status,
+            "timestamp": a.created_at.strftime("%Y-%m-%d %H:%M"),
+            "note": a.note
+        })
+
+    return {
+        "totalDonations": total_donations_count,
+        "activeDonations": active_donations_count,
+        "completedDonations": completed_donations_count,
+        "waitingForMatch": waiting_for_match_count,
+        "newMatchesAvailable": new_matches_available,
+        "upcomingPickups": upcoming_pickups,
+        "recentActivity": recent_activity
+    }
+
+
+# Fetch NGO Dashboard statistics (scoped to authenticated NGO's tenant)
+@router.get("/ngo/dashboard-stats", response_model=dict)
+async def get_ngo_dashboard_stats(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != models.UserRole.NGO:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    ngo_profile = current_user.ngo_profile
+    if not ngo_profile or not ngo_profile.tenant_id:
+        raise HTTPException(status_code=400, detail="NGO Profile/Tenant context not found.")
+
+    # 1. Active Demands
+    active_demands_count = db.query(models.NGODemand).filter(
+        models.NGODemand.tenant_id == ngo_profile.tenant_id,
+        models.NGODemand.status == "OPEN"
+    ).count()
+
+    # 2. High Priority Demands
+    high_priority_count = db.query(models.NGODemand).filter(
+        models.NGODemand.tenant_id == ngo_profile.tenant_id,
+        models.NGODemand.status == "OPEN",
+        models.NGODemand.priority.in_(["HIGH", "URGENT"])
+    ).count()
+
+    # 3. Incoming Donations (Pending requests to this NGO)
+    incoming_donations_count = db.query(models.DonationRequest).filter(
+        models.DonationRequest.ngo_id == current_user.id,
+        models.DonationRequest.status == "PENDING"
+    ).count()
+
+    # 4. Beneficiaries (Sum of quantities of fulfilled items * 3, fallback to sum of needed items * 3)
+    demands = db.query(models.NGODemand).filter(
+        models.NGODemand.tenant_id == ngo_profile.tenant_id
+    ).all()
+
+    total_fulfilled_qty = 0
+    total_needed_qty = 0
+    for d in demands:
+        for it in d.items:
+            total_fulfilled_qty += it.quantity_fulfilled
+            total_needed_qty += it.quantity_needed
+
+    beneficiaries = (total_fulfilled_qty * 3) if total_fulfilled_qty > 0 else (total_needed_qty * 3)
+    # Avoid showing 0 if there are active demands
+    if beneficiaries == 0 and total_needed_qty > 0:
+        beneficiaries = total_needed_qty * 3
+
+    # 5. Demand vs Supply chart data (grouped by month of creation for the current year)
+    months = ["Mar", "Apr", "May", "Jun", "Jul"]
+    import datetime
+    current_year = datetime.datetime.now().year
+    
+    chart_data = []
+    # Fetch all demands created this year
+    demands_this_year = db.query(models.NGODemand).filter(
+        models.NGODemand.tenant_id == ngo_profile.tenant_id,
+        func.extract('year', models.NGODemand.created_at) == current_year
+    ).all()
+    
+    # Aggregate by month name
+    monthly_stats = {}
+    for d in demands_this_year:
+        m_name = d.created_at.strftime("%b")
+        if m_name not in monthly_stats:
+            monthly_stats[m_name] = {"demand": 0, "supply": 0}
+        for it in d.items:
+            monthly_stats[m_name]["demand"] += it.quantity_needed
+            monthly_stats[m_name]["supply"] += it.quantity_fulfilled
+
+    # Fallback/seed default months to keep chart populated nicely
+    for m in months:
+        stats = monthly_stats.get(m, {"demand": 0, "supply": 0})
+        # If there is no real data, seed 0 or a base value to show the month
+        chart_data.append({"month": m, "demand": stats["demand"], "supply": stats["supply"]})
+
+    # 6. Urgent Needs (demands priority critical/high and not satisfied)
+    urgent_needs = []
+    for d in demands:
+        if d.status == "OPEN" and d.priority in ["HIGH", "URGENT"]:
+            for it in d.items:
+                if it.quantity_fulfilled < it.quantity_needed:
+                    urgent_needs.append({
+                        "id": str(it.id),
+                        "itemName": it.item_name,
+                        "quantityRequired": it.quantity_needed,
+                        "quantityFulfilled": it.quantity_fulfilled,
+                        "priority": d.priority.capitalize()
+                    })
+
+    # Sort/limit urgent needs
+    urgent_needs = urgent_needs[:4]
+
+    # 7. Recent Matched Donations (recent requests)
+    recent_requests = db.query(models.DonationRequest).filter(
+        models.DonationRequest.ngo_id == current_user.id
+    ).order_by(models.DonationRequest.created_at.desc()).limit(3).all()
+
+    recent_donations = []
+    for req in recent_requests:
+        donation = req.donation
+        if donation:
+            items_list = [{"id": str(it.id), "itemName": it.item_name, "quantity": it.quantity} for it in donation.items]
+            recent_donations.append({
+                "id": f"Donation #{donation.id}",
+                "status": donation.status,
+                "date": req.created_at.strftime("%Y-%m-%d") if req.created_at else "—",
+                "items": items_list
+            })
+
+    # 8. Compatible Matches (active matches)
+    matches = db.query(models.DonationMatch).filter(
+        models.DonationMatch.ngo_id == ngo_profile.id,
+        models.DonationMatch.status == "ACTIVE",
+        models.DonationMatch.final_score >= settings.MATCH_MIN_SCORE
+    ).all()
+    
+    compatible_matches_list = []
+    for m in matches:
+        donation = m.donation
+        if donation:
+            items_list = [{"id": str(it.id), "itemName": it.item_name, "quantity": it.quantity} for it in donation.items]
+            donor_prof = db.query(models.DonorProfile).filter(models.DonorProfile.user_id == donation.donor_id).first()
+            compatible_matches_list.append({
+                "id": str(m.id),
+                "donationId": str(donation.id),
+                "donorName": donor_prof.full_name if donor_prof else "Anonymous Donor",
+                "finalScore": int(m.final_score),
+                "items": items_list,
+                "date": donation.created_at.strftime("%Y-%m-%d") if donation.created_at else "—"
+            })
+
+    # 9. Accepted/Active Donations
+    accepted = db.query(models.Donation).filter(
+        models.Donation.ngo_id == current_user.id,
+        models.Donation.status.in_([
+            "NGO_ACCEPTED", "PACKAGING_IN_PROGRESS", "READY_FOR_PICKUP", "PICKUP_SCHEDULED", "COLLECTED", "DELIVERED", "PICKUP_IN_PROGRESS"
+        ])
+    ).all()
+    
+    accepted_donations_list = []
+    for d in accepted:
+        donor_prof = db.query(models.DonorProfile).filter(models.DonorProfile.user_id == d.donor_id).first()
+        accepted_donations_list.append({
+            "id": str(d.id),
+            "status": d.status,
+            "donorName": donor_prof.full_name if donor_prof else "Anonymous Donor",
+            "date": d.created_at.strftime("%Y-%m-%d") if d.created_at else "—",
+            "itemCount": sum(it.quantity for it in d.items)
+        })
+
+    # 10. Upcoming Pickups
+    today = datetime.date.today()
+    pickups = db.query(models.PickupSchedule).join(
+        models.Donation, models.Donation.id == models.PickupSchedule.donation_id
+    ).filter(
+        models.Donation.ngo_id == current_user.id,
+        models.PickupSchedule.pickup_date >= today
+    ).order_by(models.PickupSchedule.pickup_date.asc()).all()
+    
+    upcoming_pickups_list = []
+    for p in pickups:
+        donor_prof = db.query(models.DonorProfile).filter(models.DonorProfile.user_id == p.donation.donor_id).first()
+        upcoming_pickups_list.append({
+            "donationId": str(p.donation_id),
+            "date": p.pickup_date.strftime("%Y-%m-%d"),
+            "timeSlot": p.time_slot,
+            "address": p.pickup_address,
+            "phone": p.contact_phone,
+            "donorName": donor_prof.full_name if donor_prof else "Anonymous Donor"
+        })
+
+    # 11. Expiring Demands (OPEN and needed_by_date is close, e.g. next 7 days or past)
+    expiring_demands = []
+    exp_dem = db.query(models.NGODemand).filter(
+        models.NGODemand.tenant_id == ngo_profile.tenant_id,
+        models.NGODemand.status == "OPEN",
+        models.NGODemand.needed_by_date.isnot(None)
+    ).order_by(models.NGODemand.needed_by_date.asc()).limit(5).all()
+    
+    for d in exp_dem:
+        expiring_demands.append({
+            "id": str(d.id),
+            "title": d.title,
+            "expiryDate": d.needed_by_date.strftime("%Y-%m-%d")
+        })
+
+    # 12. Completed Donation History
+    completed = db.query(models.Donation).filter(
+        models.Donation.ngo_id == current_user.id,
+        models.Donation.status.in_(["ACKNOWLEDGED", "COMPLETED"])
+    ).order_by(models.Donation.updated_at.desc()).limit(10).all()
+    
+    completed_history_list = []
+    for d in completed:
+        donor_prof = db.query(models.DonorProfile).filter(models.DonorProfile.user_id == d.donor_id).first()
+        completed_history_list.append({
+            "id": str(d.id),
+            "donorName": donor_prof.full_name if donor_prof else "Anonymous Donor",
+            "date": d.created_at.strftime("%Y-%m-%d") if d.created_at else "—",
+            "completedDate": d.updated_at.strftime("%Y-%m-%d") if d.updated_at else "—",
+            "itemCount": sum(it.quantity for it in d.items)
+        })
+
+    # 13. Notifications
+    notifs = db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id
+    ).order_by(models.Notification.created_at.desc()).limit(5).all()
+    
+    notifications_list = []
+    for n in notifs:
+        notifications_list.append({
+            "id": str(n.id),
+            "title": n.title,
+            "message": n.message,
+            "isRead": n.is_read,
+            "date": n.created_at.strftime("%Y-%m-%d %H:%M") if n.created_at else "—"
+        })
+
+    return {
+        "activeDemands": active_demands_count,
+        "highPriority": high_priority_count,
+        "incomingDonations": incoming_donations_count,
+        "beneficiaries": beneficiaries,
+        "demandSupply": chart_data,
+        "urgentNeeds": urgent_needs,
+        "recentDonations": recent_donations,
+        "compatibleMatches": compatible_matches_list,
+        "acceptedDonations": accepted_donations_list,
+        "upcomingPickups": upcoming_pickups_list,
+        "expiringDemands": expiring_demands,
+        "completedDonationHistory": completed_history_list,
+        "notifications": notifications_list
+    }
 
 
 # Fetch single NGO Demand details (scoped to authenticated NGO's tenant)

@@ -8,6 +8,7 @@ from sqlalchemy import and_
 
 import models
 from config import settings
+from services.email_service import EmailService
 
 logger = logging.getLogger(__name__)
 
@@ -333,32 +334,74 @@ class MatchingService:
                              (result_state == "UPDATED" and old_score < settings.MATCH_NOTIFICATION_THRESHOLD))
 
             if should_notify:
-                ngo_dup = db.query(models.Notification).filter(models.Notification.deduplication_key == ngo_key).first()
-                if not ngo_dup:
-                    msg = f"A compatible donation is now available for your demand: {demand.title}."
-                    ngo_notif = models.Notification(
-                        user_id=ngo_profile.user_id,
-                        title="Compatible donation available",
-                        message=msg,
-                        type="MATCH",
-                        related_request_id=donation.id,
-                        deduplication_key=ngo_key
-                    )
-                    db.add(ngo_notif)
+                ngo_user = db.query(models.User).filter(models.User.id == ngo_profile.user_id).first()
+                donor_user = db.query(models.User).filter(models.User.id == donation.donor_id).first()
 
-                donor_dup = db.query(models.Notification).filter(models.Notification.deduplication_key == donor_key).first()
-                if not donor_dup:
-                    first_item = donation.items[0].item_name if donation.items else "items"
-                    msg = f"A new NGO match is available for your {first_item} donation."
-                    donor_notif = models.Notification(
-                        user_id=donation.donor_id,
-                        title="New compatible NGO match found",
-                        message=msg,
-                        type="MATCH",
-                        related_request_id=donation.id,
-                        deduplication_key=donor_key
-                    )
-                    db.add(donor_notif)
+                # NGO In-app & Email notifications
+                if ngo_user:
+                    ngo_dup = db.query(models.Notification).filter(models.Notification.deduplication_key == ngo_key).first()
+                    if not ngo_dup and ngo_user.inapp_notifications_enabled:
+                        msg = f"A compatible donation is now available for your demand: {demand.title}."
+                        ngo_notif = models.Notification(
+                            user_id=ngo_profile.user_id,
+                            title="Compatible donation available",
+                            message=msg,
+                            type="MATCH",
+                            related_request_id=donation.id,
+                            deduplication_key=ngo_key
+                        )
+                        db.add(ngo_notif)
+
+                    # Send Email (reusing centralized service, preventing duplicates via the same should_notify logic)
+                    if ngo_user.email_notifications_enabled:
+                        items_li = "".join([f"<li>{it.get('donated_item', '')} (x{it.get('donated_quantity', 1)})</li>" for it in matched_items_list])
+                        replacements = {
+                            "demand_title": demand.title,
+                            "donation_id": donation.id,
+                            "match_score": int(new_final),
+                            "matched_items_list": items_li,
+                            "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/ngo/incoming"
+                        }
+                        html = EmailService.load_template("match_available.html", replacements)
+                        EmailService.send_html_email(
+                            to_email=ngo_user.email,
+                            subject="Compatible Donation Available - Donate",
+                            html_body=html,
+                            text_fallback=f"A new compatible donation is available for your demand: {demand.title}."
+                        )
+
+                # Donor In-app & Email notifications
+                if donor_user:
+                    donor_dup = db.query(models.Notification).filter(models.Notification.deduplication_key == donor_key).first()
+                    if not donor_dup and donor_user.inapp_notifications_enabled:
+                        first_item = donation.items[0].item_name if donation.items else "items"
+                        msg = f"A new NGO match is available for your {first_item} donation."
+                        donor_notif = models.Notification(
+                            user_id=donation.donor_id,
+                            title="New compatible NGO match found",
+                            message=msg,
+                            type="MATCH",
+                            related_request_id=donation.id,
+                            deduplication_key=donor_key
+                        )
+                        db.add(donor_notif)
+
+                    if donor_user.email_notifications_enabled:
+                        items_li = "".join([f"<li>{it.get('donated_item', '')} (x{it.get('donated_quantity', 1)})</li>" for it in matched_items_list])
+                        replacements = {
+                            "donation_id": donation.id,
+                            "ngo_name": ngo_profile.organization_name,
+                            "demand_title": demand.title,
+                            "matched_items_list": items_li,
+                            "action_url": f"{getattr(settings, 'FRONTEND_URL', 'http://localhost:8080')}/donor/matches"
+                        }
+                        html = EmailService.load_template("future_match_available.html", replacements)
+                        EmailService.send_html_email(
+                            to_email=donor_user.email,
+                            subject="New compatible NGO match found - Donate",
+                            html_body=html,
+                            text_fallback=f"A new NGO match is available for your donation DON-{donation.id}."
+                        )
 
         return result_state
 

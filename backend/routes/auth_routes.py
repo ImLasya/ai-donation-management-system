@@ -31,6 +31,8 @@ def format_user_response(user: models.User, db: Session) -> schemas.UserResponse
         "id": user.id,
         "email": user.email,
         "role": user.role.value,  # Enum value ('DONOR', 'NGO', 'ADMIN')
+        "emailNotificationsEnabled": user.email_notifications_enabled,
+        "inappNotificationsEnabled": user.inapp_notifications_enabled,
     }
     if user.role == models.UserRole.DONOR:
         profile = user.donor_profile
@@ -251,3 +253,124 @@ def update_profile(
         raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")
 
     return format_user_response(user, db)
+
+
+# ─── Forgot Password ──────────────────────────────────────────────────────────
+
+@router.post("/forgot-password")
+def forgot_password(payload: dict, db: Session = Depends(get_db)):
+    """
+    Accepts { "email": "..." }.
+    Generates a secure reset token, stores it hashed on the user row,
+    and emails a reset link. Always returns 200 to prevent email enumeration.
+    """
+    import secrets
+    from datetime import datetime, timezone, timedelta
+    from config import settings
+    from services.email_service import EmailService
+
+    email_clean = payload.get("email", "").strip().lower()
+    if not email_clean:
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    user = db.query(models.User).filter(models.User.email == email_clean).first()
+
+    # Always return success — don't reveal whether the email exists
+    if not user or not user.is_active:
+        return {"success": True, "message": "If that email is registered, a reset link has been sent."}
+
+    # Generate a URL-safe token (64 hex chars = 32 bytes)
+    raw_token = secrets.token_urlsafe(32)
+    hashed_token = auth.hash_password(raw_token)  # re-use bcrypt hasher
+
+    user.password_reset_token = hashed_token
+    user.password_reset_expires = datetime.now(timezone.utc) + timedelta(hours=1)
+    db.commit()
+
+    reset_url = f"{settings.FRONTEND_URL}/reset-password?token={raw_token}&email={email_clean}"
+
+    html_body = f"""<!DOCTYPE html>
+<html><body style="font-family:sans-serif;background:#f8fafc;padding:30px">
+<div style="max-width:520px;margin:0 auto;background:white;padding:32px;border-radius:12px;border:1px solid #e2e8f0">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:24px">
+    <div style="background:#0d9488;padding:8px;border-radius:8px">
+      <span style="color:white;font-size:18px">&#10084;</span>
+    </div>
+    <span style="font-weight:700;font-size:18px;color:#0f172a">Donate</span>
+  </div>
+  <h2 style="color:#0f172a;margin:0 0 8px">Reset your password</h2>
+  <p style="color:#64748b;margin:0 0 24px">
+    We received a request to reset the password for your account (<strong>{email_clean}</strong>).
+    Click the button below to choose a new password.
+  </p>
+  <a href="{reset_url}"
+     style="display:inline-block;background:#0d9488;color:white;padding:12px 28px;
+            border-radius:8px;text-decoration:none;font-weight:600;font-size:15px">
+    Reset Password
+  </a>
+  <p style="color:#94a3b8;font-size:13px;margin-top:24px">
+    This link expires in <strong>1 hour</strong>. If you did not request a password reset,
+    you can safely ignore this email.
+  </p>
+  <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+  <p style="color:#cbd5e1;font-size:12px">DonateAI &mdash; Connecting donors with NGOs</p>
+</div>
+</body></html>"""
+
+    text_fallback = (
+        f"Reset your Donate password\n\n"
+        f"Click the link below to reset your password (expires in 1 hour):\n{reset_url}\n\n"
+        f"If you did not request this, ignore this email."
+    )
+
+    EmailService.send_html_email(
+        to_email=email_clean,
+        subject="Reset your Donate password",
+        html_body=html_body,
+        text_fallback=text_fallback,
+    )
+
+    return {"success": True, "message": "If that email is registered, a reset link has been sent."}
+
+
+@router.post("/reset-password")
+def reset_password(payload: dict, db: Session = Depends(get_db)):
+    """
+    Accepts { "email": "...", "token": "...", "new_password": "..." }.
+    Validates the token and updates the password.
+    """
+    from datetime import datetime, timezone
+
+    email_clean = payload.get("email", "").strip().lower()
+    raw_token   = payload.get("token", "").strip()
+    new_password = payload.get("new_password", "").strip()
+
+    if not email_clean or not raw_token or not new_password:
+        raise HTTPException(status_code=400, detail="Email, token, and new password are required.")
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    user = db.query(models.User).filter(models.User.email == email_clean).first()
+    if not user or not user.password_reset_token or not user.password_reset_expires:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link. Please request a new one.")
+
+    # Check expiry
+    expires = user.password_reset_expires
+    if expires.tzinfo is None:
+        from datetime import timezone as tz
+        expires = expires.replace(tzinfo=tz.utc)
+    if datetime.now(timezone.utc) > expires:
+        raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
+
+    # Verify token
+    if not auth.verify_password(raw_token, user.password_reset_token):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link. Please request a new one.")
+
+    # Set new password and clear token
+    user.password_hash = auth.hash_password(new_password)
+    user.password_reset_token = None
+    user.password_reset_expires = None
+    db.commit()
+
+    return {"success": True, "message": "Password updated successfully. You can now sign in."}

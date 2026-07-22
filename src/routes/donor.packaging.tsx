@@ -6,8 +6,9 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { useApp } from "@/context/AppContext";
-import { PACKAGING_TIPS } from "@/data/mock";
 import { Printer, ArrowRight } from "lucide-react";
 import { toast } from "sonner";
 
@@ -19,12 +20,17 @@ export const Route = createFileRoute("/donor/packaging")({
 function Packaging() {
   const { draft, setDraft } = useApp();
   const navigate = useNavigate();
-  const [items, setItems] = useState<any[]>([]);
+  const [checklist, setChecklist] = useState<Record<string, string[]>>({});
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const [packageCount, setPackageCount] = useState<number>(1);
+  const [packagingNotes, setPackagingNotes] = useState<string>(
+    "Items securely wrapped and packaged following suggestions."
+  );
   const [loading, setLoading] = useState(true);
   const [authorized, setAuthorized] = useState(false);
 
   useEffect(() => {
-    const checkStatus = async () => {
+    const fetchChecklistData = async () => {
       const donationId = draft.donationId;
       if (!donationId) {
         toast.error("No active donation found. Please submit your items first.");
@@ -34,38 +40,55 @@ function Packaging() {
 
       try {
         const token = localStorage.getItem("da_token");
-        const res = await fetch(
+        
+        // 1. First verify status and start packaging if needed
+        const trackRes = await fetch(
           `${import.meta.env.VITE_API_BASE_URL}/api/donations/${donationId}/track`,
-          {
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          },
+          { headers: { Authorization: `Bearer ${token}` } }
         );
-        if (res.ok) {
-          const data = await res.json();
-          if (data.status === "NGO_ACCEPTED" || data.status === "PACKAGING_IN_PROGRESS") {
-            setAuthorized(true);
-            setItems(data.items);
 
-            if (data.status === "NGO_ACCEPTED") {
-              // Notify backend that packaging is in progress
-              fetch(
+        if (trackRes.ok) {
+          const trackData = await trackRes.json();
+          if (trackData.status === "NGO_ACCEPTED" || trackData.status === "PACKAGING_IN_PROGRESS") {
+            setAuthorized(true);
+
+            if (trackData.status === "NGO_ACCEPTED") {
+              await fetch(
                 `${import.meta.env.VITE_API_BASE_URL}/api/donations/${donationId}/start-packaging`,
                 {
                   method: "POST",
-                  headers: {
-                    Authorization: `Bearer ${token}`,
-                  },
-                },
+                  headers: { Authorization: `Bearer ${token}` },
+                }
               ).catch((e) =>
-                console.error("Failed to transition status to packaging in progress:", e),
+                console.error("Failed to transition status to packaging in progress:", e)
               );
             }
-          } else {
-            toast.error(
-              `Packaging is only accessible after NGO acceptance. Status: ${data.status}`,
+            
+            // 2. Fetch the actual checklist tips and persistence state
+            const listRes = await fetch(
+              `${import.meta.env.VITE_API_BASE_URL}/api/donations/${donationId}/packaging-checklist`,
+              { headers: { Authorization: `Bearer ${token}` } }
             );
+
+            if (listRes.ok) {
+              const listData = await listRes.json();
+              setChecklist(listData.checklist || {});
+              setPackageCount(listData.packageCount || 1);
+              if (listData.packagingNotes) {
+                setPackagingNotes(listData.packagingNotes);
+              }
+              
+              // Restore checkboxes state
+              const restoredChecked: Record<string, boolean> = {};
+              if (listData.completedItems) {
+                listData.completedItems.forEach((key: string) => {
+                  restoredChecked[key] = true;
+                });
+              }
+              setChecked(restoredChecked);
+            }
+          } else {
+            toast.error(`Packaging is only accessible after NGO acceptance. Status: ${trackData.status}`);
             navigate({ to: "/donor/track/$id", params: { id: String(donationId) } });
           }
         } else {
@@ -73,37 +96,30 @@ function Packaging() {
           navigate({ to: "/donor/donations" });
         }
       } catch (err) {
-        console.error(err);
+        console.error("Error loading checklist:", err);
         navigate({ to: "/donor/donations" });
       } finally {
         setLoading(false);
       }
     };
-    checkStatus();
+    fetchChecklistData();
   }, [draft.donationId]);
 
-  const categories = useMemo(() => {
-    const cats = [...new Set(items.map((i) => i.category))];
-    return cats.length ? cats : (["Books", "Clothing"] as const);
-  }, [items]);
+  // Flatten tips to calculate completion percentage
+  const allTips = useMemo(() => {
+    return Object.entries(checklist).flatMap(([category, tips]) =>
+      tips.map((tip) => `${category}: ${tip}`)
+    );
+  }, [checklist]);
 
-  const allTips = useMemo(
-    () =>
-      categories.flatMap((c) =>
-        (PACKAGING_TIPS[c] ?? PACKAGING_TIPS.default).map((t) => `${c}: ${t}`),
-      ),
-    [categories],
-  );
-
-  const [checked, setChecked] = useState<Record<string, boolean>>({});
-  const done = allTips.filter((t) => checked[t]).length;
-  const pct = allTips.length ? Math.round((done / allTips.length) * 100) : 0;
+  const doneCount = allTips.filter((t) => checked[t]).length;
+  const pct = allTips.length ? Math.round((doneCount / allTips.length) * 100) : 0;
 
   if (loading) {
     return (
       <DashboardShell role="donor">
         <div className="flex h-64 items-center justify-center">
-          <p className="text-muted-foreground font-medium">Verifying packaging authorization...</p>
+          <p className="text-muted-foreground font-medium">Loading category checklist...</p>
         </div>
       </DashboardShell>
     );
@@ -118,7 +134,7 @@ function Packaging() {
         subtitle="Category-specific guidance so items arrive in great condition."
         action={
           <Button variant="outline" className="gap-2" onClick={() => window.print()}>
-            <Printer className="h-4 w-4" /> Print
+            <Printer className="h-4 w-4" /> Print Checklist
           </Button>
         }
       />
@@ -127,35 +143,30 @@ function Packaging() {
           <Card className="p-6">
             <div className="mb-4">
               <div className="mb-1 flex justify-between text-sm">
-                <span className="text-muted-foreground">Progress</span>
-                <span className="font-semibold text-foreground">{pct}%</span>
+                <span className="text-muted-foreground font-medium">Progress</span>
+                <span className="font-semibold text-primary">{pct}% Completed</span>
               </div>
               <Progress value={pct} />
             </div>
-            <div className="space-y-6">
-              {categories.map((c) => (
-                <div key={c}>
-                  <h3 className="mb-2 font-semibold text-foreground">{c}</h3>
+            
+            <div className="space-y-6 mt-4">
+              {Object.entries(checklist).map(([category, tips]) => (
+                <div key={category} className="space-y-3">
+                  <h3 className="text-base font-bold text-foreground border-l-4 border-primary pl-2">{category} Packaging Checklist</h3>
                   <div className="space-y-2">
-                    {(PACKAGING_TIPS[c] ?? PACKAGING_TIPS.default).map((t) => {
-                      const key = `${c}: ${t}`;
+                    {tips.map((tip) => {
+                      const key = `${category}: ${tip}`;
                       return (
                         <label
                           key={key}
-                          className="flex cursor-pointer items-center gap-3 rounded-lg border border-border p-3 text-sm hover:bg-muted/40"
+                          className="flex cursor-pointer items-center gap-3 rounded-lg border border-border p-3 text-sm hover:bg-muted/40 transition-colors"
                         >
                           <Checkbox
                             checked={!!checked[key]}
                             onCheckedChange={(v) => setChecked((p) => ({ ...p, [key]: !!v }))}
                           />
-                          <span
-                            className={
-                              checked[key]
-                                ? "text-muted-foreground line-through"
-                                : "text-foreground"
-                            }
-                          >
-                            {t}
+                          <span className={checked[key] ? "text-muted-foreground line-through font-medium" : "text-foreground font-medium"}>
+                            {tip}
                           </span>
                         </label>
                       );
@@ -166,19 +177,50 @@ function Packaging() {
             </div>
           </Card>
         </div>
+        
         <div>
-          <Card className="sticky top-24 p-6">
-            <h3 className="font-semibold text-foreground">Ready to ship?</h3>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Complete the checklist, then mark packaging done to schedule your pickup.
-            </p>
+          <Card className="sticky top-24 p-6 space-y-4">
+            <div>
+              <h3 className="font-semibold text-foreground text-base">Package Summary</h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                Enter details regarding how the items are packed for courier pick-up.
+              </p>
+            </div>
+            
+            <div className="space-y-1">
+              <label htmlFor="packageCount" className="text-xs font-bold text-muted-foreground uppercase">Number of Packages</label>
+              <Input
+                id="packageCount"
+                type="number"
+                min={1}
+                value={packageCount}
+                onChange={(e) => setPackageCount(Math.max(1, parseInt(e.target.value) || 1))}
+                className="w-full"
+              />
+            </div>
+            
+            <div className="space-y-1">
+              <label htmlFor="packagingNotes" className="text-xs font-bold text-muted-foreground uppercase">Courier Pickup Instructions / Notes</label>
+              <Textarea
+                id="packagingNotes"
+                placeholder="E.g. Fragile items inside box 2, call upon arrival"
+                value={packagingNotes}
+                onChange={(e) => setPackagingNotes(e.target.value)}
+                className="min-h-[80px]"
+              />
+            </div>
+
             <Button
-              className="mt-4 w-full gap-2"
+              className="w-full gap-2 bg-teal-600 hover:bg-teal-700"
               disabled={pct < 100}
               onClick={async () => {
                 const donationId = draft.donationId;
                 try {
                   const token = localStorage.getItem("da_token");
+                  
+                  // Serialize only the checked checkbox keys
+                  const completedItems = Object.keys(checked).filter((k) => checked[k]);
+                  
                   const res = await fetch(
                     `${import.meta.env.VITE_API_BASE_URL}/api/donations/${donationId}/package`,
                     {
@@ -188,9 +230,9 @@ function Packaging() {
                         Authorization: `Bearer ${token}`,
                       },
                       body: JSON.stringify({
-                        package_count: 1,
-                        packaging_notes:
-                          "Items securely wrapped and packaged following suggestions.",
+                        package_count: packageCount,
+                        packaging_notes: packagingNotes,
+                        completed_items: completedItems
                       }),
                     },
                   );
@@ -211,9 +253,10 @@ function Packaging() {
             >
               Mark Packaging Complete <ArrowRight className="h-4 w-4" />
             </Button>
+            
             {pct < 100 && (
-              <p className="mt-2 text-center text-xs text-muted-foreground">
-                Complete all items to continue
+              <p className="text-center text-xs text-muted-foreground italic font-medium">
+                Please check off all packaging suggestions above to continue.
               </p>
             )}
           </Card>

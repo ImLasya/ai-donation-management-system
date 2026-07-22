@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { DashboardShell } from "@/components/portal/DashboardShell";
 import { PageHeader } from "@/components/shared/ui";
 import { Card } from "@/components/ui/card";
@@ -25,15 +25,24 @@ const SLOTS = [
 ];
 
 function Schedule() {
-  const { draft } = useApp();
+  const { draft, user } = useApp();
   const navigate = useNavigate();
   const [date, setDate] = useState("");
   const [slot, setSlot] = useState("");
-  const [address, setAddress] = useState("42 MG Road, Bengaluru, Karnataka 560001");
-  const [phone, setPhone] = useState("+91 98765 43210");
+  const [address, setAddress] = useState(user?.address || "42 MG Road, Bengaluru, Karnataka 560001");
+  const [phone, setPhone] = useState(user?.phone || "+91 98765 43210");
   const [notes, setNotes] = useState("");
   const [confirmed, setConfirmed] = useState(false);
   const pickupId = "PU-" + Math.floor(1000 + Math.random() * 9000);
+
+  useEffect(() => {
+    if (user?.address) {
+      setAddress(user.address);
+    }
+    if (user?.phone) {
+      setPhone(user.phone);
+    }
+  }, [user]);
 
   if (confirmed) {
     return (
@@ -90,6 +99,7 @@ function Schedule() {
               id="date"
               type="date"
               className="mt-1 max-w-xs"
+              min={new Date().toISOString().split("T")[0]}
               value={date}
               onChange={(e) => setDate(e.target.value)}
             />

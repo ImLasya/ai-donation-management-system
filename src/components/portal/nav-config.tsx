@@ -48,7 +48,6 @@ export const NAV: Record<Role, NavItem[]> = {
     { label: "Dashboard", to: "/ngo/dashboard", icon: LayoutDashboard },
     { label: "Demand Registry", to: "/ngo/demands", icon: ClipboardList },
     { label: "Incoming Donations", to: "/ngo/incoming", icon: Truck },
-    { label: "Inventory", to: "/ngo/inventory", icon: Boxes },
     { label: "Notifications", to: "/ngo/notifications", icon: Bell },
     { label: "Profile", to: "/ngo/profile", icon: Building2 },
   ],

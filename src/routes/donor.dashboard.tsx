@@ -40,18 +40,21 @@ function Dashboard() {
   const { user } = useApp();
   const [impact, setImpact] = useState<DonorImpactResponse | null>(null);
   const [donations, setDonations] = useState<any[]>([]);
+  const [dbStats, setDbStats] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const loadDashboardData = async () => {
       setLoading(true);
       try {
-        const [impactData, listData] = await Promise.all([
+        const [impactData, listData, statsData] = await Promise.all([
           donationService.getImpactAnalytics(),
           donationService.list(),
+          donationService.getDonorDashboardStats(),
         ]);
         setImpact(impactData);
         setDonations(listData);
+        setDbStats(statsData);
       } catch (err) {
         console.error("Failed to load donor dashboard database data:", err);
       } finally {
@@ -81,6 +84,36 @@ function Dashboard() {
     beneficiariesReached: 0,
     beneficiariesIsEstimated: true,
     beneficiariesEstimationMethod: "total_items_donated * 3",
+  };
+
+  // Helper to determine the contextual action for a donation based on status
+  const renderDonationAction = (d: any) => {
+    if (d.status === "ITEMS_SUBMITTED" || d.status === "WAITING_FOR_MATCH") {
+      return (
+        <Button asChild size="sm">
+          <Link to="/donor/matches">View Matches</Link>
+        </Button>
+      );
+    }
+    if (d.status === "NGO_ACCEPTED" || d.status === "PACKAGING_IN_PROGRESS") {
+      return (
+        <Button asChild size="sm" variant="default" className="bg-orange-600 hover:bg-orange-700">
+          <Link to="/donor/packaging">Package Items</Link>
+        </Button>
+      );
+    }
+    if (d.status === "READY_FOR_PICKUP") {
+      return (
+        <Button asChild size="sm" variant="default" className="bg-teal-600 hover:bg-teal-700">
+          <Link to="/donor/schedule">Schedule Pickup</Link>
+        </Button>
+      );
+    }
+    return (
+      <Button asChild size="sm" variant="outline">
+        <Link to="/donor/track/$id" params={{ id: d.id }}>Track</Link>
+      </Button>
+    );
   };
 
   return (
@@ -186,7 +219,7 @@ function Dashboard() {
 
       <div className="mt-6 grid gap-6 lg:grid-cols-3">
         <SectionCard
-          title="Active Donations"
+          title="Active Donations & Quick Actions"
           className="lg:col-span-2"
           action={
             <Button asChild variant="ghost" size="sm" className="gap-1">
@@ -218,18 +251,14 @@ function Dashboard() {
                   className="flex items-center justify-between rounded-lg border border-border p-3"
                 >
                   <div>
-                    <p className="text-sm font-medium text-foreground">
+                    <p className="text-sm font-semibold text-foreground">
                       DON-{d.id} · {d.ngoName}
                     </p>
-                    <p className="text-xs text-muted-foreground">{d.items?.length || 0} item types</p>
+                    <p className="text-xs text-muted-foreground">{d.items?.length || 0} items</p>
                   </div>
                   <div className="flex items-center gap-3">
                     <StatusBadge status={d.status} />
-                    <Button asChild size="sm" variant="outline">
-                      <Link to="/donor/track/$id" params={{ id: d.id }}>
-                        Track
-                      </Link>
-                    </Button>
+                    {renderDonationAction(d)}
                   </div>
                 </div>
               ))
@@ -237,24 +266,53 @@ function Dashboard() {
           </div>
         </SectionCard>
 
-        <SectionCard title="Recommended NGOs">
-          <div className="space-y-3">
-            {NGOS.slice(0, 3).map((n) => (
-              <div key={n.id} className="flex items-center gap-3">
-                <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-                  <HeartHandshake className="h-4 w-4" />
+        <div className="space-y-6">
+          <SectionCard title="Upcoming Pickups">
+            <div className="space-y-3">
+              {loading ? (
+                <Skeleton className="h-20 w-full" />
+              ) : !dbStats?.upcomingPickups || dbStats.upcomingPickups.length === 0 ? (
+                <div className="text-sm text-muted-foreground py-2 text-center">
+                  No upcoming scheduled pickups.
                 </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium text-foreground">{n.name}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {n.city} · {n.activeDemands} demands
-                  </p>
+              ) : (
+                dbStats.upcomingPickups.map((p: any, idx: number) => (
+                  <div key={idx} className="rounded-lg border border-border p-3 space-y-1">
+                    <p className="text-sm font-medium text-foreground">DON-{p.donationId} · {p.ngoName}</p>
+                    <p className="text-xs text-muted-foreground">
+                      <strong>Date:</strong> {p.date} · <strong>Time:</strong> {p.timeSlot}
+                    </p>
+                    <p className="text-xs text-muted-foreground truncate">
+                      <strong>Address:</strong> {p.address}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </SectionCard>
+
+          <SectionCard title="Recent Activity">
+            <div className="space-y-3">
+              {loading ? (
+                <Skeleton className="h-20 w-full" />
+              ) : !dbStats?.recentActivity || dbStats.recentActivity.length === 0 ? (
+                <div className="text-sm text-muted-foreground py-2 text-center">
+                  No recent activities recorded.
                 </div>
-                <StatusBadge status={n.priority} />
-              </div>
-            ))}
-          </div>
-        </SectionCard>
+              ) : (
+                dbStats.recentActivity.map((a: any, idx: number) => (
+                  <div key={idx} className="flex flex-col border-b border-border pb-2 last:border-0 last:pb-0">
+                    <span className="text-xs text-muted-foreground">{a.timestamp}</span>
+                    <span className="text-sm font-medium text-foreground">
+                      DON-{a.donationId} transitioned to {a.newStatus.replace(/_/g, " ")}
+                    </span>
+                    {a.note && <span className="text-xs text-muted-foreground italic mt-0.5">"{a.note}"</span>}
+                  </div>
+                ))
+              )}
+            </div>
+          </SectionCard>
+        </div>
       </div>
     </DashboardShell>
   );

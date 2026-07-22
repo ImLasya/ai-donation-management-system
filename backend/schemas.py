@@ -31,6 +31,8 @@ class UserResponse(BaseModel):
     email: str
     role: str
     name: str
+    emailNotificationsEnabled: bool = True
+    inappNotificationsEnabled: bool = True
     org: Optional[str] = None
     phone: Optional[str] = None
     city: Optional[str] = None

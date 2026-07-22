@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333333; margin: 0; padding: 20px; background-color: #f9f9f9; }
+    .card { max-width: 600px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
+    .header { border-bottom: 2px solid #0d9488; padding-bottom: 15px; margin-bottom: 20px; }
+    .title { color: #0d9488; margin: 0; font-size: 24px; font-weight: bold; }
+    .content { font-size: 16px; margin-bottom: 25px; }
+    .footer { font-size: 12px; color: #718096; border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 20px; text-align: center; }
+    .btn { display: inline-block; background-color: #0d9488; color: #ffffff !important; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: 600; margin-top: 15px; }
+    ul { padding-left: 20px; }
+    li { margin-bottom: 5px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <h1 class="title">Donation Collected & In Transit</h1>
+    </div>
+    <div class="content">
+      <p>Hello {{ donor_name }},</p>
+      <p>Your donation <strong>DON-{{ donation_id }}</strong> has been successfully collected by <strong>{{ ngo_name }}</strong> and is currently in transit to their facility.</p>
+      <p>We will notify you as soon as the items are delivered and verified.</p>
+      <a href="{{ action_url }}" class="btn">Track Delivery Journey</a>
+    </div>
+    <div class="footer">
+      <p>This is an automated notification from DonateAI. Please do not reply directly to this email.</p>
+    </div>
+  </div>
+</body>
+</html>

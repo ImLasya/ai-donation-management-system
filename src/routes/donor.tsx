@@ -19,13 +19,16 @@ function DonorLayout() {
       });
       return;
     }
-    if (user.role !== "donor") {
+    
+    const isTrackRoute = location.pathname.includes("/track/");
+    if (user.role !== "donor" && (!isTrackRoute || user.role !== "ngo")) {
       const dest = user.role === "ngo" ? "/ngo/dashboard" : "/admin/dashboard";
       navigate({ to: dest });
     }
   }, [user, navigate, location]);
 
-  if (!user || user.role !== "donor") {
+  const isTrackRoute = location.pathname.includes("/track/");
+  if (!user || (user.role !== "donor" && (!isTrackRoute || user.role !== "ngo"))) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background">
         <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />

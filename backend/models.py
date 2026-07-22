@@ -28,6 +28,10 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(Enum(UserRole, name="user_role", create_type=False), nullable=False)
     is_active = Column(Boolean, default=True)
+    email_notifications_enabled = Column(Boolean, default=True, server_default='true', nullable=False)
+    inapp_notifications_enabled = Column(Boolean, default=True, server_default='true', nullable=False)
+    password_reset_token = Column(String(256), nullable=True, index=True)
+    password_reset_expires = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -154,6 +158,10 @@ class PickupSchedule(Base):
     pickup_address = Column(Text, nullable=False)
     contact_phone = Column(String(50), nullable=False)
     notes = Column(Text, nullable=True)
+    reminder_status = Column(String(50), default="PENDING", server_default='PENDING', nullable=False)
+    volunteer_name = Column(String(255), nullable=True)
+    volunteer_phone = Column(String(50), nullable=True)
+    volunteer_email = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     donation = relationship("Donation", back_populates="pickup_schedule")
@@ -215,6 +223,7 @@ class PackagingRecord(Base):
     packaging_status = Column(String(50), default="COMPLETED", nullable=False)
     package_count = Column(Integer, default=1, nullable=False)
     packaging_notes = Column(Text, nullable=True)
+    completed_items = Column(Text, nullable=True) # JSON-serialized list of checkbox keys
     completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
